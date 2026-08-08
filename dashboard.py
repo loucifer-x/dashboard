@@ -26,7 +26,7 @@ DIM = "#777777"
 # =========================
 
 IDLE_TIME = 1  # Seconds before screensaver starts
-IMAGE_PATH = "image.png"
+IMAGE_PATH = "images.jpg"
 
 
 class Dashboard(tk.Tk):
