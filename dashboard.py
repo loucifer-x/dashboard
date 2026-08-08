@@ -1,15 +1,16 @@
-
+```python
 import tkinter as tk
 import socket
 import time
 from datetime import datetime
 
 import psutil
+from PIL import Image, ImageTk
 
 
-# =========================
-# COLOURS
-# =========================
+# ============================================================
+# SETTINGS
+# ============================================================
 
 BG = "#050505"
 PANEL = "#0d0d0d"
@@ -21,12 +22,11 @@ RED_DIM = "#b30000"
 TEXT = "#ffffff"
 DIM = "#777777"
 
-# =========================
-# SETTINGS
-# =========================
+# Seconds of inactivity before screensaver
+IDLE_TIME = 60
 
-IDLE_TIME = 1  # Seconds before screensaver starts
-IMAGE_PATH = "images.jpg"
+# Screensaver image
+IMAGE_PATH = "/root/dashboard/images.jpg"
 
 
 class Dashboard(tk.Tk):
@@ -35,35 +35,49 @@ class Dashboard(tk.Tk):
         super().__init__()
 
         self.title("Server Dashboard")
-        self.configure(bg=BG)
 
         # Fullscreen
         self.attributes("-fullscreen", True)
 
+        self.configure(bg=BG)
+
         # Screensaver state
         self.screensaver_active = False
         self.last_activity = time.time()
+
         self.screensaver_image = None
 
-        # Detect activity
+        # ----------------------------------------------------
+        # Detect mouse / keyboard activity
+        # ----------------------------------------------------
+
         self.bind_all("<Motion>", self.user_activity)
         self.bind_all("<Key>", self.user_activity)
         self.bind_all("<Button>", self.user_activity)
 
+        # ----------------------------------------------------
         # Build dashboard
+        # ----------------------------------------------------
+
         self.create_ui()
 
+        # ----------------------------------------------------
         # Start updates
+        # ----------------------------------------------------
+
         self.update_dashboard()
         self.check_idle()
 
-    # =========================
+    # ========================================================
     # DASHBOARD UI
-    # =========================
+    # ========================================================
 
     def create_ui(self):
 
+        # ----------------------------------------------------
         # Header
+        # ----------------------------------------------------
+
         header = tk.Frame(
             self,
             bg=BG
@@ -108,7 +122,10 @@ class Dashboard(tk.Tk):
             padx=(0, 25)
         )
 
+        # ----------------------------------------------------
         # Red separator
+        # ----------------------------------------------------
+
         separator = tk.Frame(
             self,
             bg=RED,
@@ -120,7 +137,10 @@ class Dashboard(tk.Tk):
             padx=45
         )
 
+        # ----------------------------------------------------
         # Server information
+        # ----------------------------------------------------
+
         info = tk.Frame(
             self,
             bg=BG
@@ -147,7 +167,10 @@ class Dashboard(tk.Tk):
             "UPTIME"
         )
 
+        # ----------------------------------------------------
         # Resource panels
+        # ----------------------------------------------------
+
         resources = tk.Frame(
             self,
             bg=BG
@@ -175,7 +198,10 @@ class Dashboard(tk.Tk):
             "DISK"
         )
 
+        # ----------------------------------------------------
         # Footer
+        # ----------------------------------------------------
+
         footer = tk.Frame(
             self,
             bg=BG
@@ -207,9 +233,9 @@ class Dashboard(tk.Tk):
 
         hint.pack(side="right")
 
-    # =========================
+    # ========================================================
     # INFO CARD
-    # =========================
+    # ========================================================
 
     def create_info(self, parent, title):
 
@@ -257,9 +283,9 @@ class Dashboard(tk.Tk):
 
         return value_label
 
-    # =========================
+    # ========================================================
     # RESOURCE CARD
-    # =========================
+    # ========================================================
 
     def create_resource_panel(self, parent, title):
 
@@ -332,9 +358,9 @@ class Dashboard(tk.Tk):
             "bar": bar
         }
 
-    # =========================
+    # ========================================================
     # UPDATE DASHBOARD
-    # =========================
+    # ========================================================
 
     def update_dashboard(self):
 
@@ -347,9 +373,7 @@ class Dashboard(tk.Tk):
 
         # Date
         self.date.config(
-            text=now.strftime(
-                "%A, %d %B %Y"
-            )
+            text=now.strftime("%A, %d %B %Y")
         )
 
         # Hostname
@@ -357,7 +381,7 @@ class Dashboard(tk.Tk):
             text=socket.gethostname()
         )
 
-        # IP
+        # IP address
         try:
             hostname = socket.gethostname()
             ip = socket.gethostbyname(hostname)
@@ -413,15 +437,15 @@ class Dashboard(tk.Tk):
             disk
         )
 
-        # Update every second
+        # Run again in one second
         self.after(
             1000,
             self.update_dashboard
         )
 
-    # =========================
+    # ========================================================
     # RESOURCE UPDATE
-    # =========================
+    # ========================================================
 
     def update_resource(
         self,
@@ -444,9 +468,9 @@ class Dashboard(tk.Tk):
             relheight=1
         )
 
-    # =========================
+    # ========================================================
     # USER ACTIVITY
-    # =========================
+    # ========================================================
 
     def user_activity(self, event=None):
 
@@ -455,9 +479,9 @@ class Dashboard(tk.Tk):
         if self.screensaver_active:
             self.hide_screensaver()
 
-    # =========================
-    # CHECK IDLE TIME
-    # =========================
+    # ========================================================
+    # CHECK IDLE
+    # ========================================================
 
     def check_idle(self):
 
@@ -474,14 +498,15 @@ class Dashboard(tk.Tk):
             self.check_idle
         )
 
-    # =========================
+    # ========================================================
     # SHOW SCREENSAVER
-    # =========================
+    # ========================================================
 
     def show_screensaver(self):
 
         self.screensaver_active = True
 
+        # Fullscreen black background
         self.screensaver = tk.Frame(
             self,
             bg="black"
@@ -494,10 +519,70 @@ class Dashboard(tk.Tk):
             relheight=1
         )
 
-        # Load image
+        # ----------------------------------------------------
+        # Load wallpaper
+        # ----------------------------------------------------
+
         try:
-            self.screensaver_image = tk.PhotoImage(
-                file=IMAGE_PATH
+
+            image = Image.open(
+                IMAGE_PATH
+            )
+
+            screen_width = self.winfo_screenwidth()
+            screen_height = self.winfo_screenheight()
+
+            # ------------------------------------------------
+            # Scale image so it fills the entire screen
+            # while keeping its aspect ratio.
+            # ------------------------------------------------
+
+            image_width, image_height = image.size
+
+            scale = max(
+                screen_width / image_width,
+                screen_height / image_height
+            )
+
+            new_width = int(
+                image_width * scale
+            )
+
+            new_height = int(
+                image_height * scale
+            )
+
+            image = image.resize(
+                (new_width, new_height),
+                Image.Resampling.LANCZOS
+            )
+
+            # ------------------------------------------------
+            # Crop to screen
+            # ------------------------------------------------
+
+            left = (
+                new_width - screen_width
+            ) // 2
+
+            top = (
+                new_height - screen_height
+            ) // 2
+
+            right = left + screen_width
+            bottom = top + screen_height
+
+            image = image.crop(
+                (
+                    left,
+                    top,
+                    right,
+                    bottom
+                )
+            )
+
+            self.screensaver_image = ImageTk.PhotoImage(
+                image
             )
 
             image_label = tk.Label(
@@ -507,16 +592,21 @@ class Dashboard(tk.Tk):
             )
 
             image_label.place(
-                relx=0.5,
-                rely=0.5,
-                anchor="center"
+                x=0,
+                y=0,
+                relwidth=1,
+                relheight=1
             )
 
         except Exception as error:
 
+            print(
+                f"Could not load {IMAGE_PATH}: {error}"
+            )
+
             image_label = tk.Label(
                 self.screensaver,
-                text="SCREENSAVER\nIMAGE NOT FOUND",
+                text="SCREENSAVER IMAGE NOT FOUND",
                 bg="black",
                 fg=RED,
                 font=("Segoe UI", 30, "bold")
@@ -528,15 +618,14 @@ class Dashboard(tk.Tk):
                 anchor="center"
             )
 
-            print(
-                f"Could not load {IMAGE_PATH}: {error}"
-            )
+        # ----------------------------------------------------
+        # Screensaver clock
+        # ----------------------------------------------------
 
-        # Clock over screensaver
         self.saver_clock = tk.Label(
             self.screensaver,
             text="",
-            bg="black",
+            bg="#000000",
             fg=RED,
             font=("Segoe UI", 50, "bold")
         )
@@ -549,9 +638,12 @@ class Dashboard(tk.Tk):
 
         self.update_screensaver_clock()
 
-    # =========================
+        # Make sure the screensaver receives keyboard input
+        self.screensaver.focus_set()
+
+    # ========================================================
     # SCREENSAVER CLOCK
-    # =========================
+    # ========================================================
 
     def update_screensaver_clock(self):
 
@@ -559,9 +651,7 @@ class Dashboard(tk.Tk):
             return
 
         self.saver_clock.config(
-            text=datetime.now().strftime(
-                "%H:%M:%S"
-            )
+            text=datetime.now().strftime("%H:%M:%S")
         )
 
         self.after(
@@ -569,9 +659,9 @@ class Dashboard(tk.Tk):
             self.update_screensaver_clock
         )
 
-    # =========================
+    # ========================================================
     # HIDE SCREENSAVER
-    # =========================
+    # ========================================================
 
     def hide_screensaver(self):
 
@@ -586,13 +676,13 @@ class Dashboard(tk.Tk):
         self.last_activity = time.time()
 
 
-# =========================
-# START
-# =========================
+# ============================================================
+# START APPLICATION
+# ============================================================
 
 if __name__ == "__main__":
 
     app = Dashboard()
 
     app.mainloop()
-
+```
