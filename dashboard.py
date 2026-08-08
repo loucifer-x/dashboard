@@ -1,4 +1,4 @@
-```python
+
 import tkinter as tk
 import socket
 import time
@@ -685,4 +685,4 @@ if __name__ == "__main__":
     app = Dashboard()
 
     app.mainloop()
-```
+
