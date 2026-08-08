@@ -25,7 +25,7 @@ DIM = "#777777"
 # SETTINGS
 # =========================
 
-IDLE_TIME = 60  # Seconds before screensaver starts
+IDLE_TIME = 1  # Seconds before screensaver starts
 IMAGE_PATH = "/root/dashboard/image.png"
 
 
