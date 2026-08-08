@@ -1,677 +1,650 @@
+#!/usr/bin/env python3
+"""
+Server Dashboard
+=================
+A fullscreen tkinter dashboard for monitoring a Linux server: CPU, memory,
+disk, network, temperature, load average, and top processes. Includes an
+idle screensaver and threshold-based color coding.
 
-import tkinter as tk
+Run: python3 dashboard.py
+Quit: Escape key
+Toggle fullscreen: F11
+"""
+
+import collections
+import logging
+import os
 import socket
+import sys
 import time
 from datetime import datetime
 
-import psutil
-from PIL import Image, ImageTk
+import tkinter as tk
+
+try:
+    import psutil
+except ImportError:
+    print("ERROR: psutil is required. Install it with: pip install psutil")
+    sys.exit(1)
+
+try:
+    from PIL import Image, ImageTk
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
 
 
 # ============================================================
-# SETTINGS
+# CONFIG  (edit these to taste)
+# ============================================================
+
+class Config:
+    # --- Behavior ---
+    FULLSCREEN_ON_START = True
+    IDLE_SECONDS = 60          # seconds of inactivity before screensaver
+    REFRESH_MS = 1000          # dashboard refresh interval
+    HISTORY_LENGTH = 60        # data points kept for sparkline graphs
+
+    # --- Screensaver ---
+    SCREENSAVER_IMAGE = "/root/dashboard/images.jpg"
+
+    # --- Monitoring ---
+    DISK_PATH = "/"
+    NET_INTERFACE = None       # None = sum of all interfaces
+    TOP_PROCESS_COUNT = 5
+
+    # --- Thresholds (percent) for color coding ---
+    THRESHOLD_WARN = 60
+    THRESHOLD_CRIT = 85
+
+    # --- Logging ---
+    LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.log")
+
+
+# ============================================================
+# COLORS / THEME
 # ============================================================
 
 BG = "#050505"
 PANEL = "#0d0d0d"
+PANEL_ALT = "#111111"
 
 RED = "#ff2020"
 DARK_RED = "#8b0000"
 RED_DIM = "#b30000"
 
+GREEN = "#8b0000"
+YELLOW = "#f1c40f"
+
 TEXT = "#ffffff"
 DIM = "#777777"
+DIM2 = "#4d4d4d"
 
-# Seconds of inactivity before screensaver
-IDLE_TIME = 1
 
-# Screensaver image
-IMAGE_PATH = "/root/dashboard/images.jpg"
+def status_color(percent):
+    """Return a color based on how hot a metric is."""
+    if percent is None:
+        return DIM
+    if percent >= Config.THRESHOLD_CRIT:
+        return RED
+    if percent >= Config.THRESHOLD_WARN:
+        return YELLOW
+    return GREEN
 
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+logging.basicConfig(
+    filename=Config.LOG_FILE,
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+
+
+def safe(fn, default=None, label=""):
+    """Run fn() and log+swallow any exception, returning default instead."""
+    try:
+        return fn()
+    except Exception as error:
+        logging.warning("safe() failed for %s: %s", label or fn, error)
+        return default
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def get_local_ip():
+    """
+    Get the machine's real LAN IP. socket.gethostbyname(hostname) is
+    unreliable on servers (often returns 127.0.1.1 or raises), so we open
+    a UDP "connection" instead -- no packets are actually sent.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except Exception:
+        return "Unavailable"
+    finally:
+        s.close()
+
+
+def format_bytes_per_sec(bytes_per_sec):
+    for unit in ("B/s", "KB/s", "MB/s", "GB/s"):
+        if bytes_per_sec < 1024:
+            return f"{bytes_per_sec:.1f} {unit}"
+        bytes_per_sec /= 1024
+    return f"{bytes_per_sec:.1f} TB/s"
+
+
+def format_bytes(n):
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} PB"
+
+
+# ============================================================
+# SPARKLINE (rolling history graph on a Canvas)
+# ============================================================
+
+class Sparkline(tk.Canvas):
+    def __init__(self, parent, color=RED, height=36, maxlen=Config.HISTORY_LENGTH, **kwargs):
+        super().__init__(
+            parent, bg=PANEL, height=height, highlightthickness=0, **kwargs
+        )
+        self.color = color
+        self.data = collections.deque([0] * maxlen, maxlen=maxlen)
+        self.bind("<Configure>", lambda e: self.redraw())
+
+    def push(self, value):
+        self.data.append(max(0, min(100, value)))
+        self.redraw()
+
+    def redraw(self):
+        self.delete("all")
+        width = self.winfo_width()
+        height = self.winfo_height()
+        if width <= 1 or height <= 1:
+            return
+
+        n = len(self.data)
+        if n < 2:
+            return
+
+        step = width / (n - 1)
+        points = []
+        for i, value in enumerate(self.data):
+            x = i * step
+            y = height - (value / 100) * height
+            points.extend([x, y])
+
+        # baseline
+        self.create_line(0, height - 1, width, height - 1, fill="#1a1a1a")
+
+        self.create_line(*points, fill=self.color, width=2, smooth=True)
+
+
+# ============================================================
+# MAIN APP
+# ============================================================
 
 class Dashboard(tk.Tk):
     def __init__(self):
         super().__init__()
 
         self.title("Server Dashboard")
-
-        # Fullscreen
-        self.attributes("-fullscreen", True)
-
         self.configure(bg=BG)
+
+        self.is_fullscreen = Config.FULLSCREEN_ON_START
+        self.attributes("-fullscreen", self.is_fullscreen)
 
         # Screensaver state
         self.screensaver_active = False
         self.last_activity = time.time()
-
         self.screensaver_image = None
 
-        # ----------------------------------------------------
-        # Detect mouse / keyboard activity
-        # ----------------------------------------------------
+        # Network / disk I/O baselines (for rate calculation)
+        self._last_net = safe(psutil.net_io_counters, label="net_io_counters")
+        self._last_disk_io = safe(psutil.disk_io_counters, label="disk_io_counters")
+        self._last_sample_time = time.time()
 
+        # Prime CPU percent (first call always returns 0.0)
+        safe(lambda: psutil.cpu_percent(percpu=True), label="cpu_percent priming")
+
+        # ----------------------------------------------------
+        # Global key bindings
+        # ----------------------------------------------------
         self.bind_all("<Motion>", self.user_activity)
         self.bind_all("<Key>", self.user_activity)
         self.bind_all("<Button>", self.user_activity)
-
-        # ----------------------------------------------------
-        # Build dashboard
-        # ----------------------------------------------------
+        self.bind("<Escape>", lambda e: self.quit_app())
+        self.bind("<F11>", lambda e: self.toggle_fullscreen())
 
         self.create_ui()
-
-        # ----------------------------------------------------
-        # Start updates
-        # ----------------------------------------------------
-
         self.update_dashboard()
         self.check_idle()
 
+    def quit_app(self):
+        self.destroy()
+
+    def toggle_fullscreen(self):
+        self.is_fullscreen = not self.is_fullscreen
+        self.attributes("-fullscreen", self.is_fullscreen)
+
     # ========================================================
-    # DASHBOARD UI
+    # UI CONSTRUCTION
     # ========================================================
 
     def create_ui(self):
+        self.create_header()
+        self.create_separator()
+        self.create_info_row()
+        self.create_resource_row()
+        self.create_secondary_row()
+        self.create_process_row()
+        self.create_footer()
 
-        # ----------------------------------------------------
-        # Header
-        # ----------------------------------------------------
+    def create_header(self):
+        header = tk.Frame(self, bg=BG)
+        header.pack(fill="x", padx=45, pady=(25, 12))
 
-        header = tk.Frame(
-            self,
-            bg=BG
-        )
-
-        header.pack(
-            fill="x",
-            padx=45,
-            pady=(30, 15)
-        )
-
-        title = tk.Label(
-            header,
-            text="SERVER DASHBOARD",
-            bg=BG,
-            fg=RED,
-            font=("Segoe UI", 30, "bold")
-        )
-
-        title.pack(side="left")
+        tk.Label(
+            header, text="SERVER DASHBOARD", bg=BG, fg=RED,
+            font=("Segoe UI", 28, "bold")
+        ).pack(side="left")
 
         self.clock = tk.Label(
-            header,
-            text="00:00:00",
-            bg=BG,
-            fg=TEXT,
-            font=("Segoe UI", 26, "bold")
+            header, text="00:00:00", bg=BG, fg=TEXT, font=("Segoe UI", 24, "bold")
         )
-
         self.clock.pack(side="right")
 
-        self.date = tk.Label(
-            header,
-            text="",
-            bg=BG,
-            fg=DIM,
-            font=("Segoe UI", 11)
-        )
+        self.date = tk.Label(header, text="", bg=BG, fg=DIM, font=("Segoe UI", 11))
+        self.date.pack(side="right", padx=(0, 25))
 
-        self.date.pack(
-            side="right",
-            padx=(0, 25)
-        )
+    def create_separator(self):
+        tk.Frame(self, bg=RED, height=2).pack(fill="x", padx=45)
 
-        # ----------------------------------------------------
-        # Red separator
-        # ----------------------------------------------------
+    def create_info_row(self):
+        info = tk.Frame(self, bg=BG)
+        info.pack(fill="x", padx=40, pady=18)
 
-        separator = tk.Frame(
-            self,
-            bg=RED,
-            height=2
-        )
+        self.hostname = self.create_info_card(info, "HOSTNAME")
+        self.ip = self.create_info_card(info, "IP ADDRESS")
+        self.uptime = self.create_info_card(info, "UPTIME")
+        self.loadavg = self.create_info_card(info, "LOAD AVG (1/5/15m)")
 
-        separator.pack(
-            fill="x",
-            padx=45
-        )
+    def create_info_card(self, parent, title):
+        frame = tk.Frame(parent, bg=PANEL, highlightbackground=DARK_RED, highlightthickness=1)
+        frame.pack(side="left", fill="both", expand=True, padx=6)
 
-        # ----------------------------------------------------
-        # Server information
-        # ----------------------------------------------------
-
-        info = tk.Frame(
-            self,
-            bg=BG
-        )
-
-        info.pack(
-            fill="x",
-            padx=40,
-            pady=25
-        )
-
-        self.hostname = self.create_info(
-            info,
-            "HOSTNAME"
-        )
-
-        self.ip = self.create_info(
-            info,
-            "IP ADDRESS"
-        )
-
-        self.uptime = self.create_info(
-            info,
-            "UPTIME"
-        )
-
-        # ----------------------------------------------------
-        # Resource panels
-        # ----------------------------------------------------
-
-        resources = tk.Frame(
-            self,
-            bg=BG
-        )
-
-        resources.pack(
-            fill="both",
-            expand=True,
-            padx=40,
-            pady=10
-        )
-
-        self.cpu = self.create_resource_panel(
-            resources,
-            "CPU USAGE"
-        )
-
-        self.ram = self.create_resource_panel(
-            resources,
-            "MEMORY"
-        )
-
-        self.disk = self.create_resource_panel(
-            resources,
-            "DISK"
-        )
-
-        # ----------------------------------------------------
-        # Footer
-        # ----------------------------------------------------
-
-        footer = tk.Frame(
-            self,
-            bg=BG
-        )
-
-        footer.pack(
-            fill="x",
-            padx=45,
-            pady=25
-        )
-
-        self.status = tk.Label(
-            footer,
-            text="● SYSTEM ONLINE",
-            bg=BG,
-            fg=RED,
-            font=("Segoe UI", 12, "bold")
-        )
-
-        self.status.pack(side="left")
-
-        hint = tk.Label(
-            footer,
-            text="AFK SCREENSAVER: 60s",
-            bg=BG,
-            fg=DIM,
-            font=("Segoe UI", 9)
-        )
-
-        hint.pack(side="right")
-
-    # ========================================================
-    # INFO CARD
-    # ========================================================
-
-    def create_info(self, parent, title):
-
-        frame = tk.Frame(
-            parent,
-            bg=PANEL,
-            highlightbackground=DARK_RED,
-            highlightthickness=1
-        )
-
-        frame.pack(
-            side="left",
-            fill="both",
-            expand=True,
-            padx=6
-        )
-
-        title_label = tk.Label(
-            frame,
-            text=title,
-            bg=PANEL,
-            fg=RED_DIM,
-            font=("Segoe UI", 9, "bold")
-        )
-
-        title_label.pack(
-            anchor="w",
-            padx=20,
-            pady=(15, 3)
-        )
-
-        value_label = tk.Label(
-            frame,
-            text="Loading...",
-            bg=PANEL,
-            fg=TEXT,
-            font=("Segoe UI", 16, "bold")
-        )
-
-        value_label.pack(
-            anchor="w",
-            padx=20,
-            pady=(0, 15)
-        )
-
-        return value_label
-
-    # ========================================================
-    # RESOURCE CARD
-    # ========================================================
-
-    def create_resource_panel(self, parent, title):
-
-        frame = tk.Frame(
-            parent,
-            bg=PANEL,
-            highlightbackground=DARK_RED,
-            highlightthickness=1
-        )
-
-        frame.pack(
-            side="left",
-            fill="both",
-            expand=True,
-            padx=8
-        )
-
-        title_label = tk.Label(
-            frame,
-            text=title,
-            bg=PANEL,
-            fg=RED_DIM,
-            font=("Segoe UI", 12, "bold")
-        )
-
-        title_label.pack(
-            anchor="w",
-            padx=25,
-            pady=(25, 5)
-        )
+        tk.Label(
+            frame, text=title, bg=PANEL, fg=RED_DIM, font=("Segoe UI", 9, "bold")
+        ).pack(anchor="w", padx=20, pady=(14, 3))
 
         value = tk.Label(
-            frame,
-            text="0%",
-            bg=PANEL,
-            fg=TEXT,
-            font=("Segoe UI", 46, "bold")
+            frame, text="Loading...", bg=PANEL, fg=TEXT, font=("Segoe UI", 15, "bold")
         )
+        value.pack(anchor="w", padx=20, pady=(0, 14))
+        return value
 
-        value.pack(
-            pady=25
-        )
+    def create_resource_row(self):
+        resources = tk.Frame(self, bg=BG)
+        resources.pack(fill="both", expand=True, padx=40, pady=8)
 
-        bar_background = tk.Frame(
-            frame,
-            bg="#222222",
-            height=10
-        )
+        self.cpu = self.create_resource_panel(resources, "CPU USAGE")
+        self.ram = self.create_resource_panel(resources, "MEMORY")
+        self.disk = self.create_resource_panel(resources, "DISK")
 
-        bar_background.pack(
-            fill="x",
-            padx=25
-        )
+    def create_resource_panel(self, parent, title):
+        frame = tk.Frame(parent, bg=PANEL, highlightbackground=DARK_RED, highlightthickness=1)
+        frame.pack(side="left", fill="both", expand=True, padx=8)
 
-        bar = tk.Frame(
-            bar_background,
-            bg=RED,
-            height=10
-        )
+        tk.Label(
+            frame, text=title, bg=PANEL, fg=RED_DIM, font=("Segoe UI", 12, "bold")
+        ).pack(anchor="w", padx=25, pady=(20, 2))
 
-        bar.place(
-            x=0,
-            y=0,
-            relheight=1,
-            relwidth=0
-        )
+        value = tk.Label(frame, text="0%", bg=PANEL, fg=TEXT, font=("Segoe UI", 40, "bold"))
+        value.pack(pady=(5, 2))
+
+        detail = tk.Label(frame, text="", bg=PANEL, fg=DIM, font=("Segoe UI", 10))
+        detail.pack(pady=(0, 10))
+
+        bar_bg = tk.Frame(frame, bg="#222222", height=8)
+        bar_bg.pack(fill="x", padx=25)
+        bar = tk.Frame(bar_bg, bg=GREEN, height=8)
+        bar.place(x=0, y=0, relheight=1, relwidth=0)
+
+        spark = Sparkline(frame, color=RED)
+        spark.pack(fill="x", padx=25, pady=(12, 6))
+
+        # per-core mini bars only meaningful for CPU; created lazily below
+        cores_frame = tk.Frame(frame, bg=PANEL)
+        cores_frame.pack(fill="x", padx=25, pady=(0, 16))
 
         return {
             "value": value,
-            "bar": bar
+            "detail": detail,
+            "bar": bar,
+            "spark": spark,
+            "cores_frame": cores_frame,
+            "core_bars": [],
         }
 
+    def create_secondary_row(self):
+        row = tk.Frame(self, bg=BG)
+        row.pack(fill="x", padx=40, pady=8)
+
+        self.network = self.create_secondary_card(row, "NETWORK I/O")
+        self.swap = self.create_secondary_card(row, "SWAP")
+        self.temp = self.create_secondary_card(row, "TEMPERATURE")
+
+    def create_secondary_card(self, parent, title):
+        frame = tk.Frame(parent, bg=PANEL, highlightbackground=DARK_RED, highlightthickness=1)
+        frame.pack(side="left", fill="both", expand=True, padx=6)
+
+        tk.Label(
+            frame, text=title, bg=PANEL, fg=RED_DIM, font=("Segoe UI", 10, "bold")
+        ).pack(anchor="w", padx=20, pady=(12, 3))
+
+        value = tk.Label(
+            frame, text="—", bg=PANEL, fg=TEXT, font=("Segoe UI", 14, "bold"), justify="left"
+        )
+        value.pack(anchor="w", padx=20, pady=(0, 12))
+        return value
+
+    def create_process_row(self):
+        frame = tk.Frame(self, bg=PANEL, highlightbackground=DARK_RED, highlightthickness=1)
+        frame.pack(fill="x", padx=40, pady=8)
+
+        tk.Label(
+            frame, text="TOP PROCESSES (CPU)", bg=PANEL, fg=RED_DIM,
+            font=("Segoe UI", 10, "bold")
+        ).pack(anchor="w", padx=20, pady=(12, 6))
+
+        self.process_labels = []
+        rows = tk.Frame(frame, bg=PANEL)
+        rows.pack(fill="x", padx=20, pady=(0, 14))
+
+        for _ in range(Config.TOP_PROCESS_COUNT):
+            row = tk.Frame(rows, bg=PANEL)
+            row.pack(fill="x", pady=2)
+
+            name = tk.Label(row, text="—", bg=PANEL, fg=TEXT, font=("Consolas", 11), width=30, anchor="w")
+            name.pack(side="left")
+
+            cpu = tk.Label(row, text="", bg=PANEL, fg=DIM, font=("Consolas", 11), width=10, anchor="e")
+            cpu.pack(side="left")
+
+            mem = tk.Label(row, text="", bg=PANEL, fg=DIM, font=("Consolas", 11), width=10, anchor="e")
+            mem.pack(side="left")
+
+            self.process_labels.append({"name": name, "cpu": cpu, "mem": mem})
+
+    def create_footer(self):
+        footer = tk.Frame(self, bg=BG)
+        footer.pack(fill="x", padx=45, pady=20)
+
+        self.status = tk.Label(
+            footer, text="● SYSTEM ONLINE", bg=BG, fg=GREEN, font=("Segoe UI", 12, "bold")
+        )
+        self.status.pack(side="left")
+
+        tk.Label(
+            footer,
+            text=f"AFK SCREENSAVER: {Config.IDLE_SECONDS}s   |   ESC quit   |   F11 toggle fullscreen",
+            bg=BG, fg=DIM, font=("Segoe UI", 9)
+        ).pack(side="right")
+
     # ========================================================
-    # UPDATE DASHBOARD
+    # DASHBOARD UPDATE
     # ========================================================
 
     def update_dashboard(self):
-
-        now = datetime.now()
-
-        # Clock
-        self.clock.config(
-            text=now.strftime("%H:%M:%S")
-        )
-
-        # Date
-        self.date.config(
-            text=now.strftime("%A, %d %B %Y")
-        )
-
-        # Hostname
-        self.hostname.config(
-            text=socket.gethostname()
-        )
-
-        # IP address
         try:
-            hostname = socket.gethostname()
-            ip = socket.gethostbyname(hostname)
-        except Exception:
-            ip = "Unavailable"
+            self._update_dashboard_impl()
+        except Exception as error:
+            logging.error("update_dashboard failed: %s", error)
+        finally:
+            self.after(Config.REFRESH_MS, self.update_dashboard)
 
-        self.ip.config(
-            text=ip
-        )
+    def _update_dashboard_impl(self):
+        now = datetime.now()
+        self.clock.config(text=now.strftime("%H:%M:%S"))
+        self.date.config(text=now.strftime("%A, %d %B %Y"))
 
-        # Uptime
-        uptime_seconds = int(
-            time.time() - psutil.boot_time()
-        )
+        self.hostname.config(text=safe(socket.gethostname, "Unavailable", "hostname"))
+        self.ip.config(text=safe(get_local_ip, "Unavailable", "ip"))
 
-        days = uptime_seconds // 86400
+        self._update_uptime()
+        self._update_loadavg()
+        self._update_cpu()
+        self._update_ram()
+        self._update_disk()
+        self._update_network()
+        self._update_swap()
+        self._update_temperature()
+        self._update_processes()
 
-        hours = (
-            uptime_seconds % 86400
-        ) // 3600
+    def _update_uptime(self):
+        def calc():
+            seconds = int(time.time() - psutil.boot_time())
+            d, rem = divmod(seconds, 86400)
+            h, rem = divmod(rem, 3600)
+            m, _ = divmod(rem, 60)
+            return f"{d}d {h}h {m}m"
+        self.uptime.config(text=safe(calc, "Unavailable", "uptime"))
 
-        minutes = (
-            uptime_seconds % 3600
-        ) // 60
+    def _update_loadavg(self):
+        def calc():
+            one, five, fifteen = os.getloadavg()
+            return f"{one:.2f} / {five:.2f} / {fifteen:.2f}"
+        self.loadavg.config(text=safe(calc, "N/A", "loadavg"))
 
-        self.uptime.config(
-            text=f"{days}d {hours}h {minutes}m"
-        )
+    def _update_cpu(self):
+        overall = safe(lambda: psutil.cpu_percent(interval=None), 0, "cpu overall")
+        per_core = safe(lambda: psutil.cpu_percent(interval=None, percpu=True), [], "cpu percore")
 
-        # CPU
-        cpu = psutil.cpu_percent(
-            interval=None
-        )
+        self._set_resource(self.cpu, overall, detail=f"{psutil.cpu_count()} cores")
+        self._update_core_bars(per_core)
 
-        self.update_resource(
-            self.cpu,
-            cpu
-        )
+    def _update_core_bars(self, per_core):
+        panel = self.cpu
+        # (Re)build core bars once, or if core count changed
+        if len(panel["core_bars"]) != len(per_core):
+            for widget in panel["cores_frame"].winfo_children():
+                widget.destroy()
+            panel["core_bars"] = []
+            for _ in per_core:
+                bar_bg = tk.Frame(panel["cores_frame"], bg="#222222", height=5)
+                bar_bg.pack(fill="x", pady=1)
+                bar = tk.Frame(bar_bg, bg=GREEN, height=5)
+                bar.place(x=0, y=0, relheight=1, relwidth=0)
+                panel["core_bars"].append(bar)
 
-        # RAM
-        ram = psutil.virtual_memory().percent
+        for bar, pct in zip(panel["core_bars"], per_core):
+            bar.config(bg=status_color(pct))
+            bar.place(relwidth=max(0, min(pct / 100, 1)), relheight=1)
 
-        self.update_resource(
-            self.ram,
-            ram
-        )
+    def _update_ram(self):
+        def calc():
+            vm = psutil.virtual_memory()
+            return vm.percent, f"{format_bytes(vm.used)} / {format_bytes(vm.total)}"
+        result = safe(calc, (0, ""), "ram")
+        percent, detail = result if result else (0, "")
+        self._set_resource(self.ram, percent, detail=detail)
 
-        # Disk
-        disk = psutil.disk_usage("/").percent
+    def _update_disk(self):
+        def calc():
+            du = psutil.disk_usage(Config.DISK_PATH)
+            return du.percent, f"{format_bytes(du.used)} / {format_bytes(du.total)}"
+        result = safe(calc, (0, ""), "disk")
+        percent, detail = result if result else (0, "")
+        self._set_resource(self.disk, percent, detail=detail)
 
-        self.update_resource(
-            self.disk,
-            disk
-        )
+    def _set_resource(self, panel, percent, detail=""):
+        percent = percent or 0
+        color = status_color(percent)
+        panel["value"].config(text=f"{percent:.0f}%", fg=color)
+        panel["detail"].config(text=detail)
+        panel["bar"].config(bg=color)
+        panel["bar"].place(relwidth=max(0, min(percent / 100, 1)), relheight=1)
+        panel["spark"].color = color
+        panel["spark"].push(percent)
 
-        # Run again in one second
-        self.after(
-            1000,
-            self.update_dashboard
-        )
+    def _update_network(self):
+        def calc():
+            counters = psutil.net_io_counters()
+            now = time.time()
+            elapsed = max(now - self._last_sample_time, 0.001)
+
+            sent_rate = (counters.bytes_sent - self._last_net.bytes_sent) / elapsed
+            recv_rate = (counters.bytes_recv - self._last_net.bytes_recv) / elapsed
+
+            self._last_net = counters
+            self._last_sample_time = now
+
+            return f"↑ {format_bytes_per_sec(sent_rate)}\n↓ {format_bytes_per_sec(recv_rate)}"
+
+        self.network.config(text=safe(calc, "Unavailable", "network"))
+
+    def _update_swap(self):
+        def calc():
+            sw = psutil.swap_memory()
+            if sw.total == 0:
+                return "No swap configured"
+            return f"{sw.percent:.0f}%\n{format_bytes(sw.used)} / {format_bytes(sw.total)}"
+        self.swap.config(text=safe(calc, "Unavailable", "swap"))
+
+    def _update_temperature(self):
+        def calc():
+            sensors = psutil.sensors_temperatures()
+            if not sensors:
+                return "No sensors found"
+            # Grab the first available sensor reading
+            for name, entries in sensors.items():
+                for entry in entries:
+                    if entry.current:
+                        return f"{entry.current:.0f}°C\n({entry.label or name})"
+            return "No sensors found"
+        self.temp.config(text=safe(calc, "Not supported", "temperature"))
+
+    def _update_processes(self):
+        def calc():
+            procs = []
+            for p in psutil.process_iter(["pid", "name", "cpu_percent", "memory_percent"]):
+                try:
+                    procs.append(p.info)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            procs.sort(key=lambda p: p["cpu_percent"] or 0, reverse=True)
+            return procs[: Config.TOP_PROCESS_COUNT]
+
+        top = safe(calc, [], "processes")
+        for i, row in enumerate(self.process_labels):
+            if i < len(top):
+                p = top[i]
+                row["name"].config(text=(p["name"] or "?")[:28])
+                row["cpu"].config(text=f"{p['cpu_percent']:.1f}% cpu")
+                row["mem"].config(text=f"{p['memory_percent']:.1f}% mem")
+            else:
+                row["name"].config(text="—")
+                row["cpu"].config(text="")
+                row["mem"].config(text="")
 
     # ========================================================
-    # RESOURCE UPDATE
-    # ========================================================
-
-    def update_resource(
-        self,
-        resource,
-        percentage
-    ):
-
-        resource["value"].config(
-            text=f"{percentage:.0f}%"
-        )
-
-        resource["bar"].place(
-            relwidth=max(
-                0,
-                min(
-                    percentage / 100,
-                    1
-                )
-            ),
-            relheight=1
-        )
-
-    # ========================================================
-    # USER ACTIVITY
+    # IDLE / SCREENSAVER
     # ========================================================
 
     def user_activity(self, event=None):
-
         self.last_activity = time.time()
-
         if self.screensaver_active:
             self.hide_screensaver()
 
-    # ========================================================
-    # CHECK IDLE
-    # ========================================================
-
     def check_idle(self):
-
         idle_time = time.time() - self.last_activity
-
-        if (
-            idle_time >= IDLE_TIME
-            and not self.screensaver_active
-        ):
+        if idle_time >= Config.IDLE_SECONDS and not self.screensaver_active:
             self.show_screensaver()
-
-        self.after(
-            1000,
-            self.check_idle
-        )
-
-    # ========================================================
-    # SHOW SCREENSAVER
-    # ========================================================
+        self.after(1000, self.check_idle)
 
     def show_screensaver(self):
-
         self.screensaver_active = True
 
-        # Fullscreen black background
-        self.screensaver = tk.Frame(
-            self,
-            bg="black"
-        )
+        self.screensaver = tk.Frame(self, bg="black")
+        self.screensaver.place(x=0, y=0, relwidth=1, relheight=1)
 
-        self.screensaver.place(
-            x=0,
-            y=0,
-            relwidth=1,
-            relheight=1
-        )
-
-        # ----------------------------------------------------
-        # Load wallpaper
-        # ----------------------------------------------------
-
-        try:
-
-            image = Image.open(
-                IMAGE_PATH
-            )
-
-            screen_width = self.winfo_screenwidth()
-            screen_height = self.winfo_screenheight()
-
-            # ------------------------------------------------
-            # Scale image so it fills the entire screen
-            # while keeping its aspect ratio.
-            # ------------------------------------------------
-
-            image_width, image_height = image.size
-
-            scale = max(
-                screen_width / image_width,
-                screen_height / image_height
-            )
-
-            new_width = int(
-                image_width * scale
-            )
-
-            new_height = int(
-                image_height * scale
-            )
-
-            image = image.resize(
-                (new_width, new_height),
-                Image.Resampling.LANCZOS
-            )
-
-            # ------------------------------------------------
-            # Crop to screen
-            # ------------------------------------------------
-
-            left = (
-                new_width - screen_width
-            ) // 2
-
-            top = (
-                new_height - screen_height
-            ) // 2
-
-            right = left + screen_width
-            bottom = top + screen_height
-
-            image = image.crop(
-                (
-                    left,
-                    top,
-                    right,
-                    bottom
-                )
-            )
-
-            self.screensaver_image = ImageTk.PhotoImage(
-                image
-            )
-
-            image_label = tk.Label(
-                self.screensaver,
-                image=self.screensaver_image,
-                bg="black"
-            )
-
-            image_label.place(
-                x=0,
-                y=0,
-                relwidth=1,
-                relheight=1
-            )
-
-        except Exception as error:
-
-            print(
-                f"Could not load {IMAGE_PATH}: {error}"
-            )
-
-            image_label = tk.Label(
-                self.screensaver,
-                text="SCREENSAVER IMAGE NOT FOUND",
-                bg="black",
-                fg=RED,
-                font=("Segoe UI", 30, "bold")
-            )
-
-            image_label.place(
-                relx=0.5,
-                rely=0.5,
-                anchor="center"
-            )
-
-        # ----------------------------------------------------
-        # Screensaver clock
-        # ----------------------------------------------------
+        self._load_screensaver_image()
 
         self.saver_clock = tk.Label(
-            self.screensaver,
-            text="",
-            bg="#000000",
-            fg=RED,
-            font=("Segoe UI", 50, "bold")
+            self.screensaver, text="", bg="#000000", fg=RED, font=("Segoe UI", 46, "bold")
         )
+        self.saver_clock.place(relx=0.5, rely=0.85, anchor="center")
 
-        self.saver_clock.place(
-            relx=0.5,
-            rely=0.9,
-            anchor="center"
+        self.saver_stats = tk.Label(
+            self.screensaver, text="", bg="#000000", fg=DIM, font=("Segoe UI", 13),
+            justify="center"
         )
+        self.saver_stats.place(relx=0.5, rely=0.93, anchor="center")
 
-        self.update_screensaver_clock()
-
-        # Make sure the screensaver receives keyboard input
+        self.update_screensaver()
         self.screensaver.focus_set()
 
-    # ========================================================
-    # SCREENSAVER CLOCK
-    # ========================================================
+    def _load_screensaver_image(self):
+        if not PIL_AVAILABLE:
+            self._screensaver_fallback_label("PIL/Pillow not installed")
+            return
 
-    def update_screensaver_clock(self):
+        if not os.path.exists(Config.SCREENSAVER_IMAGE):
+            self._screensaver_fallback_label("SCREENSAVER IMAGE NOT FOUND")
+            return
 
+        try:
+            image = Image.open(Config.SCREENSAVER_IMAGE)
+            screen_w, screen_h = self.winfo_screenwidth(), self.winfo_screenheight()
+            img_w, img_h = image.size
+
+            scale = max(screen_w / img_w, screen_h / img_h)
+            new_w, new_h = int(img_w * scale), int(img_h * scale)
+            image = image.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+            left = (new_w - screen_w) // 2
+            top = (new_h - screen_h) // 2
+            image = image.crop((left, top, left + screen_w, top + screen_h))
+
+            self.screensaver_image = ImageTk.PhotoImage(image)
+            tk.Label(
+                self.screensaver, image=self.screensaver_image, bg="black"
+            ).place(x=0, y=0, relwidth=1, relheight=1)
+
+        except Exception as error:
+            logging.warning("Could not load screensaver image: %s", error)
+            self._screensaver_fallback_label("SCREENSAVER IMAGE NOT FOUND")
+
+    def _screensaver_fallback_label(self, text):
+        tk.Label(
+            self.screensaver, text=text, bg="black", fg=RED, font=("Segoe UI", 28, "bold")
+        ).place(relx=0.5, rely=0.5, anchor="center")
+
+    def update_screensaver(self):
         if not self.screensaver_active:
             return
 
-        self.saver_clock.config(
-            text=datetime.now().strftime("%H:%M:%S")
-        )
+        self.saver_clock.config(text=datetime.now().strftime("%H:%M:%S"))
 
-        self.after(
-            1000,
-            self.update_screensaver_clock
-        )
+        cpu = safe(lambda: psutil.cpu_percent(interval=None), 0, "saver cpu")
+        ram = safe(lambda: psutil.virtual_memory().percent, 0, "saver ram")
+        self.saver_stats.config(text=f"CPU {cpu:.0f}%   ·   MEM {ram:.0f}%")
 
-    # ========================================================
-    # HIDE SCREENSAVER
-    # ========================================================
+        self.after(1000, self.update_screensaver)
 
     def hide_screensaver(self):
-
         self.screensaver_active = False
-
-        if hasattr(
-            self,
-            "screensaver"
-        ):
+        if hasattr(self, "screensaver"):
             self.screensaver.destroy()
-
         self.last_activity = time.time()
 
 
@@ -683,12 +656,12 @@ if __name__ == "__main__":
     try:
         app = Dashboard()
         app.mainloop()
-
     except Exception as e:
+        logging.exception("Fatal dashboard error")
         print("\n" + "=" * 60)
         print("DASHBOARD ERROR")
         print("=" * 60)
         print(f"{type(e).__name__}: {e}")
+        print(f"See {Config.LOG_FILE} for details")
         print("=" * 60 + "\n")
-
         raise
