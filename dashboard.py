@@ -23,7 +23,7 @@ TEXT = "#ffffff"
 DIM = "#777777"
 
 # Seconds of inactivity before screensaver
-IDLE_TIME = 60
+IDLE_TIME = 1
 
 # Screensaver image
 IMAGE_PATH = "/root/dashboard/images.jpg"
