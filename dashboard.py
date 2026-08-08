@@ -30,7 +30,7 @@ IMAGE_PATH = "/root/dashboard/images.jpg"
 
 
 class Dashboard(tk.Tk):
-
+r
     def __init__(self):
         super().__init__()
 
