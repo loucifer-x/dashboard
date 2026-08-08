@@ -681,8 +681,15 @@ class Dashboard(tk.Tk):
 # ============================================================
 
 if __name__ == "__main__":
+    try:
+        app = Dashboard()
+        app.mainloop()
 
-    app = Dashboard()
+    except Exception as e:
+        print("\n" + "=" * 60)
+        print("DASHBOARD ERROR")
+        print("=" * 60)
+        print(f"{type(e).__name__}: {e}")
+        print("=" * 60 + "\n")
 
-    app.mainloop()
-
+        raise
