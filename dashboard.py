@@ -4,21 +4,17 @@ Server Dashboard
 =================
 A fullscreen tkinter dashboard for monitoring a Linux server: CPU, memory,
 disk, network, temperature, load average, and top processes. Includes an
-idle screensaver, threshold-based color coding, and an Apps panel for
-launching linked applications (e.g. Splunk).
+idle screensaver and threshold-based color coding.
 
 Run: python3 dashboard.py
 Quit: Escape key
 Toggle fullscreen: F11
-Toggle Apps panel: click "APPS" in the header
 """
 
 import collections
 import logging
 import os
-import shutil
 import socket
-import subprocess
 import sys
 import time
 from datetime import datetime
@@ -60,55 +56,6 @@ class Config:
     # --- Thresholds (percent) for color coding ---
     THRESHOLD_WARN = 60
     THRESHOLD_CRIT = 85
-
-    # --- Apps panel ---
-    # Each entry needs a "name" plus either a "url" (opened via BROWSER_CANDIDATES,
-    # see below) or a "command" (a list, passed straight to subprocess.Popen,
-    # e.g. ["xterm"] or ["/usr/bin/some-tool", "--flag"]). If you know exactly
-    # which browser is installed on this machine, it's more reliable to skip
-    # "url" entirely and specify "command" directly, e.g.:
-    #   {"name": "Splunk", "command": ["chromium-browser", "--new-window", "https://splunk.example.com"]}
-    APPS = [
-        {"name": "Splunk", "url": "https://splunk.example.com"},
-        # {"name": "Grafana", "url": "https://grafana.example.com"},
-        # {"name": "Terminal", "command": ["xterm"]},
-    ]
-
-    # --- Browser launch (used only for APPS entries with "url") ---
-    # Tried in order; the first binary found on PATH (via shutil.which) is
-    # used. We do NOT rely on the webbrowser module / update-alternatives
-    # "www-browser" symlink, because on minimal/kiosk Linux installs that
-    # symlink is frequently unset and fails with a raw, uncatchable
-    # "failed to execute child process www-browser" error printed straight
-    # to stderr instead of a normal Python exception.
-    BROWSER_CANDIDATES = [
-        ["xdg-open", "{url}"],
-        ["google-chrome", "--new-window", "{url}"],
-        ["chromium-browser", "--new-window", "{url}"],
-        ["chromium", "--new-window", "{url}"],
-        ["firefox", "--new-window", "{url}"],
-    ]
-
-    # --- Embedded browser apps (Linux/X11 only) ---
-    # If True, apps with a "url" open INSIDE the dashboard window (the
-    # browser's X11 window is reparented into a Tk frame via xdotool)
-    # instead of as a separate floating window. Requires: X11 (not
-    # Wayland), the `xdotool` package, and the browser below installed.
-    # If any of those aren't available, falls back automatically to
-    # opening a normal external window (BROWSER_CANDIDATES above).
-    #
-    # NOTE: most browsers enforce "single instance" -- if one is already
-    # running elsewhere, a new Popen call just forwards the URL to it and
-    # exits immediately, so xdotool never finds a window owned by *our*
-    # process. Give the embedded instance its own profile so it always
-    # starts a fresh, embeddable process.
-    EMBED_APPS = True
-    EMBED_BROWSER_CMD = [
-        "firefox", "--new-instance", "--no-remote",
-        "--profile", "/root/dashboard/embed-profile",
-        "--new-window", "{url}",
-    ]
-    EMBED_WINDOW_TIMEOUT = 10   # seconds to wait for the browser window to appear
 
     # --- Logging ---
     LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.log")
@@ -206,12 +153,9 @@ def format_bytes(n):
 # ============================================================
 
 class Sparkline(tk.Canvas):
-    def __init__(self, parent, color=RED, height=36, width=60, maxlen=Config.HISTORY_LENGTH, **kwargs):
-        # Small explicit width so this widget doesn't force its parent to
-        # request Tk's oversized default Canvas width (200px). Packed with
-        # fill="x" it will still stretch to whatever space is available.
+    def __init__(self, parent, color=RED, height=36, maxlen=Config.HISTORY_LENGTH, **kwargs):
         super().__init__(
-            parent, bg=PANEL, height=height, width=width, highlightthickness=0, **kwargs
+            parent, bg=PANEL, height=height, highlightthickness=0, **kwargs
         )
         self.color = color
         self.data = collections.deque([0] * maxlen, maxlen=maxlen)
@@ -264,21 +208,6 @@ class Dashboard(tk.Tk):
         self.last_activity = time.time()
         self.screensaver_image = None
 
-        # View state ("dashboard" or "apps")
-        self.current_view = "dashboard"
-
-        # Cache which browser binary works, so we only probe PATH once.
-        self._resolved_browser_cmd = None
-        self._browser_probe_done = False
-
-        # Embedded-browser state (see Config.EMBED_APPS)
-        self.embed_proc = None
-        self.embed_winid = None
-        self.embed_app_name = None
-        self._embed_poll_job = None
-        self._embed_resize_job = None
-        self._embed_poll_attempts = 0
-
         # Network / disk I/O baselines (for rate calculation)
         self._last_net = safe(psutil.net_io_counters, label="net_io_counters")
         self._last_disk_io = safe(psutil.disk_io_counters, label="disk_io_counters")
@@ -301,7 +230,6 @@ class Dashboard(tk.Tk):
         self.check_idle()
 
     def quit_app(self):
-        self._teardown_embedded()
         self.destroy()
 
     def toggle_fullscreen(self):
@@ -315,75 +243,35 @@ class Dashboard(tk.Tk):
     def create_ui(self):
         self.create_header()
         self.create_separator()
-
-        # Body area holds both the dashboard view and the apps view,
-        # stacked in the same grid cell so we can flip between them
-        # with tkraise() instead of destroying/rebuilding widgets.
-        self.body = tk.Frame(self, bg=BG)
-        self.body.pack(fill="both", expand=True)
-        self.body.grid_rowconfigure(0, weight=1)
-        self.body.grid_columnconfigure(0, weight=1)
-
-        self.dashboard_frame = tk.Frame(self.body, bg=BG)
-        self.apps_frame = tk.Frame(self.body, bg=BG)
-        self.embedded_frame = tk.Frame(self.body, bg=BG)
-        self.dashboard_frame.grid(row=0, column=0, sticky="nsew")
-        self.apps_frame.grid(row=0, column=0, sticky="nsew")
-        self.embedded_frame.grid(row=0, column=0, sticky="nsew")
-
-        self.create_info_row(self.dashboard_frame)
-        self.create_resource_row(self.dashboard_frame)
-        self.create_secondary_row(self.dashboard_frame)
-        self.create_process_row(self.dashboard_frame)
-        self.create_footer(self.dashboard_frame)
-
-        self.create_apps_view(self.apps_frame)
-        self.create_embedded_view(self.embedded_frame)
-
-        self.show_dashboard_view()
+        self.create_info_row()
+        self.create_resource_row()
+        self.create_secondary_row()
+        self.create_process_row()
+        self.create_footer()
 
     def create_header(self):
         header = tk.Frame(self, bg=BG)
-        header.pack(fill="x", padx=18, pady=(8, 4))
-
-        # Top row: title (left) + APPS button (right). Only two widgets share
-        # this row, so the button can never get squeezed off-screen by a
-        # long date/clock string on narrow displays.
-        top_row = tk.Frame(header, bg=BG)
-        top_row.pack(fill="x")
+        header.pack(fill="x", padx=45, pady=(25, 12))
 
         tk.Label(
-            top_row, text="SERVER DASHBOARD", bg=BG, fg=RED,
-            font=("Segoe UI", 18, "bold")
+            header, text="SERVER DASHBOARD", bg=BG, fg=RED,
+            font=("Segoe UI", 28, "bold")
         ).pack(side="left")
 
-        self.nav_button = tk.Button(
-            top_row, text="APPS \u25b8", command=self.toggle_view,
-            bg=PANEL, fg=RED, activebackground=DARK_RED, activeforeground=TEXT,
-            font=("Segoe UI", 10, "bold"), relief="flat", bd=0,
-            padx=14, pady=5, cursor="hand2",
-            highlightbackground=DARK_RED, highlightthickness=1,
-        )
-        self.nav_button.pack(side="right")
-
-        # Bottom row: date + clock, smaller and out of the button's way.
-        bottom_row = tk.Frame(header, bg=BG)
-        bottom_row.pack(fill="x", pady=(2, 0))
-
         self.clock = tk.Label(
-            bottom_row, text="00:00:00", bg=BG, fg=TEXT, font=("Segoe UI", 13, "bold")
+            header, text="00:00:00", bg=BG, fg=TEXT, font=("Segoe UI", 24, "bold")
         )
         self.clock.pack(side="right")
 
-        self.date = tk.Label(bottom_row, text="", bg=BG, fg=DIM, font=("Segoe UI", 9))
-        self.date.pack(side="right", padx=(0, 12))
+        self.date = tk.Label(header, text="", bg=BG, fg=DIM, font=("Segoe UI", 11))
+        self.date.pack(side="right", padx=(0, 25))
 
     def create_separator(self):
-        tk.Frame(self, bg=RED, height=2).pack(fill="x", padx=18)
+        tk.Frame(self, bg=RED, height=2).pack(fill="x", padx=45)
 
-    def create_info_row(self, parent):
-        info = tk.Frame(parent, bg=BG)
-        info.pack(fill="x", padx=18, pady=4)
+    def create_info_row(self):
+        info = tk.Frame(self, bg=BG)
+        info.pack(fill="x", padx=40, pady=18)
 
         self.hostname = self.create_info_card(info, "HOSTNAME")
         self.ip = self.create_info_card(info, "IP ADDRESS")
@@ -395,18 +283,18 @@ class Dashboard(tk.Tk):
         frame.pack(side="left", fill="both", expand=True, padx=6)
 
         tk.Label(
-            frame, text=title, bg=PANEL, fg=RED_DIM, font=("Segoe UI", 8, "bold")
-        ).pack(anchor="w", padx=12, pady=(6, 1))
+            frame, text=title, bg=PANEL, fg=RED_DIM, font=("Segoe UI", 9, "bold")
+        ).pack(anchor="w", padx=20, pady=(14, 3))
 
         value = tk.Label(
-            frame, text="Loading...", bg=PANEL, fg=TEXT, font=("Segoe UI", 13, "bold")
+            frame, text="Loading...", bg=PANEL, fg=TEXT, font=("Segoe UI", 15, "bold")
         )
-        value.pack(anchor="w", padx=12, pady=(0, 6))
+        value.pack(anchor="w", padx=20, pady=(0, 14))
         return value
 
-    def create_resource_row(self, parent):
-        resources = tk.Frame(parent, bg=BG)
-        resources.pack(fill="both", expand=True, padx=18, pady=3)
+    def create_resource_row(self):
+        resources = tk.Frame(self, bg=BG)
+        resources.pack(fill="both", expand=True, padx=40, pady=8)
 
         self.cpu = self.create_resource_panel(resources, "CPU USAGE")
         self.ram = self.create_resource_panel(resources, "MEMORY")
@@ -417,26 +305,26 @@ class Dashboard(tk.Tk):
         frame.pack(side="left", fill="both", expand=True, padx=8)
 
         tk.Label(
-            frame, text=title, bg=PANEL, fg=RED_DIM, font=("Segoe UI", 10, "bold")
-        ).pack(anchor="w", padx=14, pady=(6, 1))
+            frame, text=title, bg=PANEL, fg=RED_DIM, font=("Segoe UI", 12, "bold")
+        ).pack(anchor="w", padx=25, pady=(20, 2))
 
-        value = tk.Label(frame, text="0%", bg=PANEL, fg=TEXT, font=("Segoe UI", 22, "bold"))
-        value.pack(pady=(1, 1))
+        value = tk.Label(frame, text="0%", bg=PANEL, fg=TEXT, font=("Segoe UI", 40, "bold"))
+        value.pack(pady=(5, 2))
 
-        detail = tk.Label(frame, text="", bg=PANEL, fg=DIM, font=("Segoe UI", 9))
-        detail.pack(pady=(0, 3))
+        detail = tk.Label(frame, text="", bg=PANEL, fg=DIM, font=("Segoe UI", 10))
+        detail.pack(pady=(0, 10))
 
-        bar_bg = tk.Frame(frame, bg="#222222", height=5)
-        bar_bg.pack(fill="x", padx=14)
-        bar = tk.Frame(bar_bg, bg=GREEN, height=5)
+        bar_bg = tk.Frame(frame, bg="#222222", height=8)
+        bar_bg.pack(fill="x", padx=25)
+        bar = tk.Frame(bar_bg, bg=GREEN, height=8)
         bar.place(x=0, y=0, relheight=1, relwidth=0)
 
-        spark = Sparkline(frame, color=RED, height=18)
-        spark.pack(fill="x", padx=14, pady=(4, 2))
+        spark = Sparkline(frame, color=RED)
+        spark.pack(fill="x", padx=25, pady=(12, 6))
 
         # per-core mini bars only meaningful for CPU; created lazily below
         cores_frame = tk.Frame(frame, bg=PANEL)
-        cores_frame.pack(fill="x", padx=14, pady=(0, 5))
+        cores_frame.pack(fill="x", padx=25, pady=(0, 16))
 
         return {
             "value": value,
@@ -447,9 +335,9 @@ class Dashboard(tk.Tk):
             "core_bars": [],
         }
 
-    def create_secondary_row(self, parent):
-        row = tk.Frame(parent, bg=BG)
-        row.pack(fill="x", padx=18, pady=3)
+    def create_secondary_row(self):
+        row = tk.Frame(self, bg=BG)
+        row.pack(fill="x", padx=40, pady=8)
 
         self.network = self.create_secondary_card(row, "NETWORK I/O")
         self.swap = self.create_secondary_card(row, "SWAP")
@@ -460,49 +348,49 @@ class Dashboard(tk.Tk):
         frame.pack(side="left", fill="both", expand=True, padx=6)
 
         tk.Label(
-            frame, text=title, bg=PANEL, fg=RED_DIM, font=("Segoe UI", 9, "bold")
-        ).pack(anchor="w", padx=12, pady=(6, 1))
+            frame, text=title, bg=PANEL, fg=RED_DIM, font=("Segoe UI", 10, "bold")
+        ).pack(anchor="w", padx=20, pady=(12, 3))
 
         value = tk.Label(
-            frame, text="\u2014", bg=PANEL, fg=TEXT, font=("Segoe UI", 12, "bold"), justify="left"
+            frame, text="—", bg=PANEL, fg=TEXT, font=("Segoe UI", 14, "bold"), justify="left"
         )
-        value.pack(anchor="w", padx=12, pady=(0, 6))
+        value.pack(anchor="w", padx=20, pady=(0, 12))
         return value
 
-    def create_process_row(self, parent):
-        frame = tk.Frame(parent, bg=PANEL, highlightbackground=DARK_RED, highlightthickness=1)
-        frame.pack(fill="x", padx=18, pady=3)
+    def create_process_row(self):
+        frame = tk.Frame(self, bg=PANEL, highlightbackground=DARK_RED, highlightthickness=1)
+        frame.pack(fill="x", padx=40, pady=8)
 
         tk.Label(
             frame, text="TOP PROCESSES (CPU)", bg=PANEL, fg=RED_DIM,
-            font=("Segoe UI", 9, "bold")
-        ).pack(anchor="w", padx=12, pady=(6, 2))
+            font=("Segoe UI", 10, "bold")
+        ).pack(anchor="w", padx=20, pady=(12, 6))
 
         self.process_labels = []
         rows = tk.Frame(frame, bg=PANEL)
-        rows.pack(fill="x", padx=12, pady=(0, 6))
+        rows.pack(fill="x", padx=20, pady=(0, 14))
 
         for _ in range(Config.TOP_PROCESS_COUNT):
             row = tk.Frame(rows, bg=PANEL)
-            row.pack(fill="x", pady=1)
+            row.pack(fill="x", pady=2)
 
-            name = tk.Label(row, text="\u2014", bg=PANEL, fg=TEXT, font=("Consolas", 10), width=24, anchor="w")
+            name = tk.Label(row, text="—", bg=PANEL, fg=TEXT, font=("Consolas", 11), width=30, anchor="w")
             name.pack(side="left")
 
-            cpu = tk.Label(row, text="", bg=PANEL, fg=DIM, font=("Consolas", 10), width=9, anchor="e")
+            cpu = tk.Label(row, text="", bg=PANEL, fg=DIM, font=("Consolas", 11), width=10, anchor="e")
             cpu.pack(side="left")
 
-            mem = tk.Label(row, text="", bg=PANEL, fg=DIM, font=("Consolas", 10), width=9, anchor="e")
+            mem = tk.Label(row, text="", bg=PANEL, fg=DIM, font=("Consolas", 11), width=10, anchor="e")
             mem.pack(side="left")
 
             self.process_labels.append({"name": name, "cpu": cpu, "mem": mem})
 
-    def create_footer(self, parent):
-        footer = tk.Frame(parent, bg=BG)
-        footer.pack(fill="x", padx=18, pady=4)
+    def create_footer(self):
+        footer = tk.Frame(self, bg=BG)
+        footer.pack(fill="x", padx=45, pady=20)
 
         self.status = tk.Label(
-            footer, text="\u25cf SYSTEM ONLINE", bg=BG, fg=GREEN, font=("Segoe UI", 12, "bold")
+            footer, text="● SYSTEM ONLINE", bg=BG, fg=GREEN, font=("Segoe UI", 12, "bold")
         )
         self.status.pack(side="left")
 
@@ -511,346 +399,6 @@ class Dashboard(tk.Tk):
             text=f"AFK SCREENSAVER: {Config.IDLE_SECONDS}s   |   ESC quit   |   F11 toggle fullscreen",
             bg=BG, fg=DIM, font=("Segoe UI", 9)
         ).pack(side="right")
-
-    # ========================================================
-    # APPS VIEW
-    # ========================================================
-
-    def create_apps_view(self, parent):
-        tk.Label(
-            parent, text="APPS", bg=BG, fg=RED, font=("Segoe UI", 18, "bold")
-        ).pack(anchor="w", padx=18, pady=(16, 2))
-
-        tk.Label(
-            parent, text="Launch a linked application", bg=BG, fg=DIM,
-            font=("Segoe UI", 10)
-        ).pack(anchor="w", padx=18, pady=(0, 12))
-
-        grid_frame = tk.Frame(parent, bg=BG)
-        grid_frame.pack(fill="both", expand=True, padx=18, pady=6)
-
-        columns = 3
-        for i in range(columns):
-            grid_frame.grid_columnconfigure(i, weight=1, uniform="apps")
-
-        if not Config.APPS:
-            tk.Label(
-                grid_frame, text="No apps configured. Add entries to Config.APPS.",
-                bg=BG, fg=DIM, font=("Segoe UI", 11)
-            ).grid(row=0, column=0, columnspan=columns, pady=30)
-        else:
-            for index, app in enumerate(Config.APPS):
-                row, col = divmod(index, columns)
-                self.create_app_tile(grid_frame, app, row, col)
-
-        footer = tk.Frame(parent, bg=BG)
-        footer.pack(fill="x", padx=18, pady=(6, 12), side="bottom")
-        tk.Label(
-            footer,
-            text="ESC quit   |   F11 fullscreen   |   Click APPS to return",
-            bg=BG, fg=DIM, font=("Segoe UI", 8)
-        ).pack(side="right")
-
-    def create_app_tile(self, parent, app, row, col):
-        tile = tk.Frame(parent, bg=PANEL, highlightbackground=DARK_RED, highlightthickness=1)
-        tile.grid(row=row, column=col, padx=10, pady=10, sticky="nsew")
-
-        name_label = tk.Label(
-            tile, text=app.get("name", "App"), bg=PANEL, fg=TEXT,
-            font=("Segoe UI", 14, "bold")
-        )
-        name_label.pack(padx=20, pady=(24, 6))
-
-        subtitle = app.get("url") or " ".join(app.get("command", [])) or "No target configured"
-        subtitle_label = tk.Label(
-            tile, text=subtitle, bg=PANEL, fg=DIM, font=("Segoe UI", 9), wraplength=180
-        )
-        subtitle_label.pack(padx=20, pady=(0, 16))
-
-        launch_btn = tk.Button(
-            tile, text="LAUNCH", command=lambda a=app: self.launch_app(a),
-            bg=BG, fg=RED, activebackground=DARK_RED, activeforeground=TEXT,
-            font=("Segoe UI", 10, "bold"), relief="flat", bd=0,
-            padx=14, pady=6, cursor="hand2",
-        )
-        launch_btn.pack(pady=(0, 20))
-
-        # Let clicking anywhere on the tile (not just the button) launch it.
-        for widget in (tile, name_label, subtitle_label):
-            widget.bind("<Button-1>", lambda e, a=app: self.launch_app(a))
-            widget.config(cursor="hand2")
-
-    def launch_app(self, app):
-        name = app.get("name", "app")
-        try:
-            if app.get("url"):
-                if Config.EMBED_APPS and self._embedding_available():
-                    self.show_embedded_view(app)
-                else:
-                    self._open_url(app["url"], name)
-            elif app.get("command"):
-                subprocess.Popen(app["command"])
-                logging.info("Launched app '%s' via command: %s", name, app["command"])
-            else:
-                logging.warning("App '%s' has no url or command configured", name)
-        except Exception as error:
-            logging.error("Failed to launch app '%s': %s", name, error)
-
-    def _resolve_browser_cmd(self):
-        """
-        Find the first working browser command from Config.BROWSER_CANDIDATES,
-        based on what's actually on PATH. Cached after the first successful
-        probe so repeated launches don't re-scan the filesystem.
-
-        We deliberately do NOT use Python's webbrowser module here. On
-        minimal/kiosk Linux installs, webbrowser.open() falls back to the
-        update-alternatives "www-browser" symlink, which is frequently
-        unset and fails with a raw
-            "failed to execute child process 'www-browser'"
-        error printed straight to stderr -- not a catchable Python
-        exception -- so a try/except around webbrowser.open() doesn't
-        actually protect you from it.
-        """
-        if self._resolved_browser_cmd is not None:
-            return self._resolved_browser_cmd
-
-        self._browser_probe_done = True
-        for template in Config.BROWSER_CANDIDATES:
-            binary = template[0]
-            if shutil.which(binary):
-                self._resolved_browser_cmd = template
-                logging.info("Resolved browser for URL launches: %s", binary)
-                return template
-
-        logging.error(
-            "No working browser found on PATH. Tried: %s. "
-            "Install one of these, or set Config.APPS entries to use "
-            "\"command\" instead of \"url\" with the exact binary path.",
-            ", ".join(t[0] for t in Config.BROWSER_CANDIDATES),
-        )
-        return None
-
-    def _open_url(self, url, name):
-        template = self._resolve_browser_cmd()
-        if template is None:
-            logging.error("Cannot launch app '%s': no browser available", name)
-            return
-
-        cmd = [part.format(url=url) for part in template]
-        try:
-            subprocess.Popen(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            logging.info("Launched app '%s' via %s: %s", name, cmd[0], url)
-        except Exception as error:
-            # This binary was on PATH but failed to actually run (e.g. a
-            # broken symlink). Drop the cached choice so the next launch
-            # re-probes instead of retrying the same broken command forever.
-            logging.error("Browser '%s' failed for app '%s': %s", cmd[0], name, error)
-            self._resolved_browser_cmd = None
-
-    def toggle_view(self):
-        if self.current_view == "dashboard":
-            self.show_apps_view()
-        else:
-            self.show_dashboard_view()
-
-    def show_dashboard_view(self):
-        self._teardown_embedded()
-        self.current_view = "dashboard"
-        self.dashboard_frame.tkraise()
-        self.nav_button.config(text="APPS \u25b8")
-
-    def show_apps_view(self):
-        self._teardown_embedded()
-        self.current_view = "apps"
-        self.apps_frame.tkraise()
-        self.nav_button.config(text="\u25c2 DASHBOARD")
-
-    # ========================================================
-    # EMBEDDED BROWSER VIEW (X11 window reparenting via xdotool)
-    # ========================================================
-
-    def create_embedded_view(self, parent):
-        header = tk.Frame(parent, bg=PANEL, height=42)
-        header.pack(fill="x")
-        header.pack_propagate(False)
-
-        self.embed_title = tk.Label(
-            header, text="", bg=PANEL, fg=TEXT, font=("Segoe UI", 12, "bold")
-        )
-        self.embed_title.pack(side="left", padx=16)
-
-        back_btn = tk.Button(
-            header, text="\u25c2 BACK", command=self.close_embedded_view,
-            bg=BG, fg=RED, activebackground=DARK_RED, activeforeground=TEXT,
-            font=("Segoe UI", 10, "bold"), relief="flat", bd=0,
-            padx=14, pady=5, cursor="hand2",
-            highlightbackground=DARK_RED, highlightthickness=1,
-        )
-        back_btn.pack(side="right", padx=10, pady=5)
-
-        # Container that the browser's real X11 window gets reparented into.
-        self.embed_container = tk.Frame(parent, bg="black")
-        self.embed_container.pack(fill="both", expand=True)
-        self.embed_container.bind("<Configure>", self._on_embed_resize)
-
-        # Status/loading text shown until the window is embedded (or on error).
-        self.embed_status = tk.Label(
-            self.embed_container, text="", bg="black", fg=DIM, font=("Segoe UI", 13)
-        )
-
-    def _embedding_available(self):
-        """Check whether embedding can actually work right now."""
-        if sys.platform != "linux":
-            return False
-        if not os.environ.get("DISPLAY"):
-            return False
-        if shutil.which("xdotool") is None:
-            return False
-        if shutil.which(Config.EMBED_BROWSER_CMD[0]) is None:
-            return False
-        return True
-
-    def show_embedded_view(self, app):
-        url = app.get("url")
-        name = app.get("name", "App")
-
-        self._teardown_embedded()  # in case something else was already embedded
-
-        self.current_view = "embedded"
-        self.embed_title.config(text=name.upper())
-        self.embedded_frame.tkraise()
-
-        self.embed_status.config(text=f"Loading {name}...")
-        self.embed_status.place(relx=0.5, rely=0.5, anchor="center")
-
-        cmd = [part.format(url=url) for part in Config.EMBED_BROWSER_CMD]
-        try:
-            if "--profile" in cmd:
-                profile_dir = cmd[cmd.index("--profile") + 1]
-                os.makedirs(profile_dir, exist_ok=True)
-            self.embed_proc = subprocess.Popen(
-                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-        except Exception as error:
-            logging.error("Failed to launch embedded browser for '%s': %s", name, error)
-            self.embed_status.config(text=f"Failed to launch browser for {name}")
-            return
-
-        self.embed_app_name = name
-        self._embed_poll_attempts = 0
-        self._poll_embed_window()
-
-    def _poll_embed_window(self):
-        if self.embed_proc is None:
-            return  # closed/torn down before the window ever appeared
-
-        self._embed_poll_attempts += 1
-        max_attempts = max(1, int(Config.EMBED_WINDOW_TIMEOUT / 0.25))
-
-        try:
-            out = subprocess.check_output(
-                ["xdotool", "search", "--onlyvisible", "--pid", str(self.embed_proc.pid)],
-                stderr=subprocess.DEVNULL,
-            ).decode().strip()
-            win_ids = [w for w in out.splitlines() if w]
-        except subprocess.CalledProcessError:
-            win_ids = []
-        except Exception as error:
-            logging.warning("xdotool search failed: %s", error)
-            win_ids = []
-
-        if win_ids:
-            # Prefer the most recently created matching window.
-            self.embed_winid = win_ids[-1]
-            self._reparent_embedded_window()
-            return
-
-        if self._embed_poll_attempts >= max_attempts:
-            logging.error(
-                "Timed out waiting for embedded browser window ('%s'). If the "
-                "browser was already running elsewhere, it may have forwarded "
-                "the URL to that instance instead of opening a new window here.",
-                self.embed_app_name,
-            )
-            self.embed_status.config(
-                text=f"Could not embed {self.embed_app_name} (timed out)"
-            )
-            return
-
-        self._embed_poll_job = self.after(250, self._poll_embed_window)
-
-    def _reparent_embedded_window(self):
-        try:
-            subprocess.run(
-                ["xdotool", "windowreparent", self.embed_winid,
-                 str(self.embed_container.winfo_id())],
-                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-            self.embed_status.place_forget()
-            self._resize_embedded_window()
-            logging.info(
-                "Embedded browser window %s for '%s'", self.embed_winid, self.embed_app_name
-            )
-        except Exception as error:
-            logging.error("Failed to reparent embedded window: %s", error)
-            self.embed_status.config(text=f"Could not embed {self.embed_app_name}")
-
-    def _on_embed_resize(self, event=None):
-        if not self.embed_winid:
-            return
-        # Debounce: resizing fires <Configure> repeatedly during a drag.
-        if self._embed_resize_job:
-            self.after_cancel(self._embed_resize_job)
-        self._embed_resize_job = self.after(80, self._resize_embedded_window)
-
-    def _resize_embedded_window(self):
-        if not self.embed_winid:
-            return
-        width = self.embed_container.winfo_width()
-        height = self.embed_container.winfo_height()
-        if width <= 1 or height <= 1:
-            return
-        try:
-            subprocess.run(
-                ["xdotool", "windowmove", self.embed_winid, "0", "0"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-            subprocess.run(
-                ["xdotool", "windowsize", self.embed_winid, str(width), str(height)],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-        except Exception as error:
-            logging.warning("Failed to resize embedded window: %s", error)
-
-    def _teardown_embedded(self):
-        """Kill any embedded browser process/timers without changing view."""
-        if self._embed_poll_job:
-            self.after_cancel(self._embed_poll_job)
-            self._embed_poll_job = None
-        if self._embed_resize_job:
-            self.after_cancel(self._embed_resize_job)
-            self._embed_resize_job = None
-
-        if self.embed_proc is not None:
-            try:
-                self.embed_proc.terminate()
-            except Exception as error:
-                logging.warning("Failed to terminate embedded browser process: %s", error)
-            self.embed_proc = None
-
-        self.embed_winid = None
-        self.embed_app_name = None
-        if hasattr(self, "embed_status"):
-            self.embed_status.place_forget()
-
-    def close_embedded_view(self):
-        """User-facing 'BACK' action: tear down the embedded app and return."""
-        self._teardown_embedded()
-        self.show_apps_view()
 
     # ========================================================
     # DASHBOARD UPDATE
@@ -906,22 +454,14 @@ class Dashboard(tk.Tk):
 
     def _update_core_bars(self, per_core):
         panel = self.cpu
-        # (Re)build core bars once, or if core count changed. Bars wrap into
-        # a fixed-column grid (rather than one row per core) so the panel's
-        # height stays bounded even on servers with many cores.
+        # (Re)build core bars once, or if core count changed
         if len(panel["core_bars"]) != len(per_core):
             for widget in panel["cores_frame"].winfo_children():
                 widget.destroy()
             panel["core_bars"] = []
-
-            columns = min(max(len(per_core), 1), 16)
-            for col in range(columns):
-                panel["cores_frame"].grid_columnconfigure(col, weight=1, uniform="cores")
-
-            for idx in range(len(per_core)):
-                row, col = divmod(idx, columns)
+            for _ in per_core:
                 bar_bg = tk.Frame(panel["cores_frame"], bg="#222222", height=5)
-                bar_bg.grid(row=row, column=col, sticky="ew", padx=1, pady=1)
+                bar_bg.pack(fill="x", pady=1)
                 bar = tk.Frame(bar_bg, bg=GREEN, height=5)
                 bar.place(x=0, y=0, relheight=1, relwidth=0)
                 panel["core_bars"].append(bar)
@@ -968,7 +508,7 @@ class Dashboard(tk.Tk):
             self._last_net = counters
             self._last_sample_time = now
 
-            return f"\u2191 {format_bytes_per_sec(sent_rate)}\n\u2193 {format_bytes_per_sec(recv_rate)}"
+            return f"↑ {format_bytes_per_sec(sent_rate)}\n↓ {format_bytes_per_sec(recv_rate)}"
 
         self.network.config(text=safe(calc, "Unavailable", "network"))
 
@@ -989,7 +529,7 @@ class Dashboard(tk.Tk):
             for name, entries in sensors.items():
                 for entry in entries:
                     if entry.current:
-                        return f"{entry.current:.0f}\u00b0C\n({entry.label or name})"
+                        return f"{entry.current:.0f}°C\n({entry.label or name})"
             return "No sensors found"
         self.temp.config(text=safe(calc, "Not supported", "temperature"))
 
@@ -1012,7 +552,7 @@ class Dashboard(tk.Tk):
                 row["cpu"].config(text=f"{p['cpu_percent']:.1f}% cpu")
                 row["mem"].config(text=f"{p['memory_percent']:.1f}% mem")
             else:
-                row["name"].config(text="\u2014")
+                row["name"].config(text="—")
                 row["cpu"].config(text="")
                 row["mem"].config(text="")
 
@@ -1097,7 +637,7 @@ class Dashboard(tk.Tk):
 
         cpu = safe(lambda: psutil.cpu_percent(interval=None), 0, "saver cpu")
         ram = safe(lambda: psutil.virtual_memory().percent, 0, "saver ram")
-        self.saver_stats.config(text=f"CPU {cpu:.0f}%   \u00b7   MEM {ram:.0f}%")
+        self.saver_stats.config(text=f"CPU {cpu:.0f}%   ·   MEM {ram:.0f}%")
 
         self.after(1000, self.update_screensaver)
 
