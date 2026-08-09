@@ -89,6 +89,27 @@ class Config:
         ["firefox", "--new-window", "{url}"],
     ]
 
+    # --- Embedded browser apps (Linux/X11 only) ---
+    # If True, apps with a "url" open INSIDE the dashboard window (the
+    # browser's X11 window is reparented into a Tk frame via xdotool)
+    # instead of as a separate floating window. Requires: X11 (not
+    # Wayland), the `xdotool` package, and the browser below installed.
+    # If any of those aren't available, falls back automatically to
+    # opening a normal external window (BROWSER_CANDIDATES above).
+    #
+    # NOTE: most browsers enforce "single instance" -- if one is already
+    # running elsewhere, a new Popen call just forwards the URL to it and
+    # exits immediately, so xdotool never finds a window owned by *our*
+    # process. Give the embedded instance its own profile so it always
+    # starts a fresh, embeddable process.
+    EMBED_APPS = True
+    EMBED_BROWSER_CMD = [
+        "firefox", "--new-instance", "--no-remote",
+        "--profile", "/root/dashboard/embed-profile",
+        "--new-window", "{url}",
+    ]
+    EMBED_WINDOW_TIMEOUT = 10   # seconds to wait for the browser window to appear
+
     # --- Logging ---
     LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.log")
 
@@ -250,6 +271,14 @@ class Dashboard(tk.Tk):
         self._resolved_browser_cmd = None
         self._browser_probe_done = False
 
+        # Embedded-browser state (see Config.EMBED_APPS)
+        self.embed_proc = None
+        self.embed_winid = None
+        self.embed_app_name = None
+        self._embed_poll_job = None
+        self._embed_resize_job = None
+        self._embed_poll_attempts = 0
+
         # Network / disk I/O baselines (for rate calculation)
         self._last_net = safe(psutil.net_io_counters, label="net_io_counters")
         self._last_disk_io = safe(psutil.disk_io_counters, label="disk_io_counters")
@@ -272,6 +301,7 @@ class Dashboard(tk.Tk):
         self.check_idle()
 
     def quit_app(self):
+        self._teardown_embedded()
         self.destroy()
 
     def toggle_fullscreen(self):
@@ -296,8 +326,10 @@ class Dashboard(tk.Tk):
 
         self.dashboard_frame = tk.Frame(self.body, bg=BG)
         self.apps_frame = tk.Frame(self.body, bg=BG)
+        self.embedded_frame = tk.Frame(self.body, bg=BG)
         self.dashboard_frame.grid(row=0, column=0, sticky="nsew")
         self.apps_frame.grid(row=0, column=0, sticky="nsew")
+        self.embedded_frame.grid(row=0, column=0, sticky="nsew")
 
         self.create_info_row(self.dashboard_frame)
         self.create_resource_row(self.dashboard_frame)
@@ -306,6 +338,7 @@ class Dashboard(tk.Tk):
         self.create_footer(self.dashboard_frame)
 
         self.create_apps_view(self.apps_frame)
+        self.create_embedded_view(self.embedded_frame)
 
         self.show_dashboard_view()
 
@@ -551,7 +584,10 @@ class Dashboard(tk.Tk):
         name = app.get("name", "app")
         try:
             if app.get("url"):
-                self._open_url(app["url"], name)
+                if Config.EMBED_APPS and self._embedding_available():
+                    self.show_embedded_view(app)
+                else:
+                    self._open_url(app["url"], name)
             elif app.get("command"):
                 subprocess.Popen(app["command"])
                 logging.info("Launched app '%s' via command: %s", name, app["command"])
@@ -622,14 +658,199 @@ class Dashboard(tk.Tk):
             self.show_dashboard_view()
 
     def show_dashboard_view(self):
+        self._teardown_embedded()
         self.current_view = "dashboard"
         self.dashboard_frame.tkraise()
         self.nav_button.config(text="APPS \u25b8")
 
     def show_apps_view(self):
+        self._teardown_embedded()
         self.current_view = "apps"
         self.apps_frame.tkraise()
         self.nav_button.config(text="\u25c2 DASHBOARD")
+
+    # ========================================================
+    # EMBEDDED BROWSER VIEW (X11 window reparenting via xdotool)
+    # ========================================================
+
+    def create_embedded_view(self, parent):
+        header = tk.Frame(parent, bg=PANEL, height=42)
+        header.pack(fill="x")
+        header.pack_propagate(False)
+
+        self.embed_title = tk.Label(
+            header, text="", bg=PANEL, fg=TEXT, font=("Segoe UI", 12, "bold")
+        )
+        self.embed_title.pack(side="left", padx=16)
+
+        back_btn = tk.Button(
+            header, text="\u25c2 BACK", command=self.close_embedded_view,
+            bg=BG, fg=RED, activebackground=DARK_RED, activeforeground=TEXT,
+            font=("Segoe UI", 10, "bold"), relief="flat", bd=0,
+            padx=14, pady=5, cursor="hand2",
+            highlightbackground=DARK_RED, highlightthickness=1,
+        )
+        back_btn.pack(side="right", padx=10, pady=5)
+
+        # Container that the browser's real X11 window gets reparented into.
+        self.embed_container = tk.Frame(parent, bg="black")
+        self.embed_container.pack(fill="both", expand=True)
+        self.embed_container.bind("<Configure>", self._on_embed_resize)
+
+        # Status/loading text shown until the window is embedded (or on error).
+        self.embed_status = tk.Label(
+            self.embed_container, text="", bg="black", fg=DIM, font=("Segoe UI", 13)
+        )
+
+    def _embedding_available(self):
+        """Check whether embedding can actually work right now."""
+        if sys.platform != "linux":
+            return False
+        if not os.environ.get("DISPLAY"):
+            return False
+        if shutil.which("xdotool") is None:
+            return False
+        if shutil.which(Config.EMBED_BROWSER_CMD[0]) is None:
+            return False
+        return True
+
+    def show_embedded_view(self, app):
+        url = app.get("url")
+        name = app.get("name", "App")
+
+        self._teardown_embedded()  # in case something else was already embedded
+
+        self.current_view = "embedded"
+        self.embed_title.config(text=name.upper())
+        self.embedded_frame.tkraise()
+
+        self.embed_status.config(text=f"Loading {name}...")
+        self.embed_status.place(relx=0.5, rely=0.5, anchor="center")
+
+        cmd = [part.format(url=url) for part in Config.EMBED_BROWSER_CMD]
+        try:
+            if "--profile" in cmd:
+                profile_dir = cmd[cmd.index("--profile") + 1]
+                os.makedirs(profile_dir, exist_ok=True)
+            self.embed_proc = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+        except Exception as error:
+            logging.error("Failed to launch embedded browser for '%s': %s", name, error)
+            self.embed_status.config(text=f"Failed to launch browser for {name}")
+            return
+
+        self.embed_app_name = name
+        self._embed_poll_attempts = 0
+        self._poll_embed_window()
+
+    def _poll_embed_window(self):
+        if self.embed_proc is None:
+            return  # closed/torn down before the window ever appeared
+
+        self._embed_poll_attempts += 1
+        max_attempts = max(1, int(Config.EMBED_WINDOW_TIMEOUT / 0.25))
+
+        try:
+            out = subprocess.check_output(
+                ["xdotool", "search", "--onlyvisible", "--pid", str(self.embed_proc.pid)],
+                stderr=subprocess.DEVNULL,
+            ).decode().strip()
+            win_ids = [w for w in out.splitlines() if w]
+        except subprocess.CalledProcessError:
+            win_ids = []
+        except Exception as error:
+            logging.warning("xdotool search failed: %s", error)
+            win_ids = []
+
+        if win_ids:
+            # Prefer the most recently created matching window.
+            self.embed_winid = win_ids[-1]
+            self._reparent_embedded_window()
+            return
+
+        if self._embed_poll_attempts >= max_attempts:
+            logging.error(
+                "Timed out waiting for embedded browser window ('%s'). If the "
+                "browser was already running elsewhere, it may have forwarded "
+                "the URL to that instance instead of opening a new window here.",
+                self.embed_app_name,
+            )
+            self.embed_status.config(
+                text=f"Could not embed {self.embed_app_name} (timed out)"
+            )
+            return
+
+        self._embed_poll_job = self.after(250, self._poll_embed_window)
+
+    def _reparent_embedded_window(self):
+        try:
+            subprocess.run(
+                ["xdotool", "windowreparent", self.embed_winid,
+                 str(self.embed_container.winfo_id())],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            self.embed_status.place_forget()
+            self._resize_embedded_window()
+            logging.info(
+                "Embedded browser window %s for '%s'", self.embed_winid, self.embed_app_name
+            )
+        except Exception as error:
+            logging.error("Failed to reparent embedded window: %s", error)
+            self.embed_status.config(text=f"Could not embed {self.embed_app_name}")
+
+    def _on_embed_resize(self, event=None):
+        if not self.embed_winid:
+            return
+        # Debounce: resizing fires <Configure> repeatedly during a drag.
+        if self._embed_resize_job:
+            self.after_cancel(self._embed_resize_job)
+        self._embed_resize_job = self.after(80, self._resize_embedded_window)
+
+    def _resize_embedded_window(self):
+        if not self.embed_winid:
+            return
+        width = self.embed_container.winfo_width()
+        height = self.embed_container.winfo_height()
+        if width <= 1 or height <= 1:
+            return
+        try:
+            subprocess.run(
+                ["xdotool", "windowmove", self.embed_winid, "0", "0"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            subprocess.run(
+                ["xdotool", "windowsize", self.embed_winid, str(width), str(height)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except Exception as error:
+            logging.warning("Failed to resize embedded window: %s", error)
+
+    def _teardown_embedded(self):
+        """Kill any embedded browser process/timers without changing view."""
+        if self._embed_poll_job:
+            self.after_cancel(self._embed_poll_job)
+            self._embed_poll_job = None
+        if self._embed_resize_job:
+            self.after_cancel(self._embed_resize_job)
+            self._embed_resize_job = None
+
+        if self.embed_proc is not None:
+            try:
+                self.embed_proc.terminate()
+            except Exception as error:
+                logging.warning("Failed to terminate embedded browser process: %s", error)
+            self.embed_proc = None
+
+        self.embed_winid = None
+        self.embed_app_name = None
+        if hasattr(self, "embed_status"):
+            self.embed_status.place_forget()
+
+    def close_embedded_view(self):
+        """User-facing 'BACK' action: tear down the embedded app and return."""
+        self._teardown_embedded()
+        self.show_apps_view()
 
     # ========================================================
     # DASHBOARD UPDATE
