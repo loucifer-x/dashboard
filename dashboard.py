@@ -4,19 +4,23 @@ Server Dashboard
 =================
 A fullscreen tkinter dashboard for monitoring a Linux server: CPU, memory,
 disk, network, temperature, load average, and top processes. Includes an
-idle screensaver and threshold-based color coding.
+idle screensaver, threshold-based color coding, and an Apps panel for
+launching linked applications (e.g. Splunk).
 
 Run: python3 dashboard.py
 Quit: Escape key
 Toggle fullscreen: F11
+Toggle Apps panel: click "APPS" in the header
 """
 
 import collections
 import logging
 import os
 import socket
+import subprocess
 import sys
 import time
+import webbrowser
 from datetime import datetime
 
 import tkinter as tk
@@ -56,6 +60,16 @@ class Config:
     # --- Thresholds (percent) for color coding ---
     THRESHOLD_WARN = 60
     THRESHOLD_CRIT = 85
+
+    # --- Apps panel ---
+    # Each entry needs a "name" plus either a "url" (opened in the default
+    # web browser) or a "command" (a list, passed straight to subprocess.Popen,
+    # e.g. ["xterm"] or ["/usr/bin/some-tool", "--flag"]).
+    APPS = [
+        {"name": "Splunk", "url": "https://splunk.example.com"},
+        # {"name": "Grafana", "url": "https://grafana.example.com"},
+        # {"name": "Terminal", "command": ["xterm"]},
+    ]
 
     # --- Logging ---
     LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.log")
@@ -208,6 +222,9 @@ class Dashboard(tk.Tk):
         self.last_activity = time.time()
         self.screensaver_image = None
 
+        # View state ("dashboard" or "apps")
+        self.current_view = "dashboard"
+
         # Network / disk I/O baselines (for rate calculation)
         self._last_net = safe(psutil.net_io_counters, label="net_io_counters")
         self._last_disk_io = safe(psutil.disk_io_counters, label="disk_io_counters")
@@ -243,11 +260,29 @@ class Dashboard(tk.Tk):
     def create_ui(self):
         self.create_header()
         self.create_separator()
-        self.create_info_row()
-        self.create_resource_row()
-        self.create_secondary_row()
-        self.create_process_row()
-        self.create_footer()
+
+        # Body area holds both the dashboard view and the apps view,
+        # stacked in the same grid cell so we can flip between them
+        # with tkraise() instead of destroying/rebuilding widgets.
+        self.body = tk.Frame(self, bg=BG)
+        self.body.pack(fill="both", expand=True)
+        self.body.grid_rowconfigure(0, weight=1)
+        self.body.grid_columnconfigure(0, weight=1)
+
+        self.dashboard_frame = tk.Frame(self.body, bg=BG)
+        self.apps_frame = tk.Frame(self.body, bg=BG)
+        self.dashboard_frame.grid(row=0, column=0, sticky="nsew")
+        self.apps_frame.grid(row=0, column=0, sticky="nsew")
+
+        self.create_info_row(self.dashboard_frame)
+        self.create_resource_row(self.dashboard_frame)
+        self.create_secondary_row(self.dashboard_frame)
+        self.create_process_row(self.dashboard_frame)
+        self.create_footer(self.dashboard_frame)
+
+        self.create_apps_view(self.apps_frame)
+
+        self.show_dashboard_view()
 
     def create_header(self):
         header = tk.Frame(self, bg=BG)
@@ -266,11 +301,20 @@ class Dashboard(tk.Tk):
         self.date = tk.Label(header, text="", bg=BG, fg=DIM, font=("Segoe UI", 11))
         self.date.pack(side="right", padx=(0, 25))
 
+        self.nav_button = tk.Button(
+            header, text="APPS \u25b8", command=self.toggle_view,
+            bg=PANEL, fg=RED, activebackground=DARK_RED, activeforeground=TEXT,
+            font=("Segoe UI", 11, "bold"), relief="flat", bd=0,
+            padx=16, pady=6, cursor="hand2",
+            highlightbackground=DARK_RED, highlightthickness=1,
+        )
+        self.nav_button.pack(side="right", padx=(0, 25))
+
     def create_separator(self):
         tk.Frame(self, bg=RED, height=2).pack(fill="x", padx=45)
 
-    def create_info_row(self):
-        info = tk.Frame(self, bg=BG)
+    def create_info_row(self, parent):
+        info = tk.Frame(parent, bg=BG)
         info.pack(fill="x", padx=40, pady=18)
 
         self.hostname = self.create_info_card(info, "HOSTNAME")
@@ -292,8 +336,8 @@ class Dashboard(tk.Tk):
         value.pack(anchor="w", padx=20, pady=(0, 14))
         return value
 
-    def create_resource_row(self):
-        resources = tk.Frame(self, bg=BG)
+    def create_resource_row(self, parent):
+        resources = tk.Frame(parent, bg=BG)
         resources.pack(fill="both", expand=True, padx=40, pady=8)
 
         self.cpu = self.create_resource_panel(resources, "CPU USAGE")
@@ -335,8 +379,8 @@ class Dashboard(tk.Tk):
             "core_bars": [],
         }
 
-    def create_secondary_row(self):
-        row = tk.Frame(self, bg=BG)
+    def create_secondary_row(self, parent):
+        row = tk.Frame(parent, bg=BG)
         row.pack(fill="x", padx=40, pady=8)
 
         self.network = self.create_secondary_card(row, "NETWORK I/O")
@@ -352,13 +396,13 @@ class Dashboard(tk.Tk):
         ).pack(anchor="w", padx=20, pady=(12, 3))
 
         value = tk.Label(
-            frame, text="—", bg=PANEL, fg=TEXT, font=("Segoe UI", 14, "bold"), justify="left"
+            frame, text="\u2014", bg=PANEL, fg=TEXT, font=("Segoe UI", 14, "bold"), justify="left"
         )
         value.pack(anchor="w", padx=20, pady=(0, 12))
         return value
 
-    def create_process_row(self):
-        frame = tk.Frame(self, bg=PANEL, highlightbackground=DARK_RED, highlightthickness=1)
+    def create_process_row(self, parent):
+        frame = tk.Frame(parent, bg=PANEL, highlightbackground=DARK_RED, highlightthickness=1)
         frame.pack(fill="x", padx=40, pady=8)
 
         tk.Label(
@@ -374,7 +418,7 @@ class Dashboard(tk.Tk):
             row = tk.Frame(rows, bg=PANEL)
             row.pack(fill="x", pady=2)
 
-            name = tk.Label(row, text="—", bg=PANEL, fg=TEXT, font=("Consolas", 11), width=30, anchor="w")
+            name = tk.Label(row, text="\u2014", bg=PANEL, fg=TEXT, font=("Consolas", 11), width=30, anchor="w")
             name.pack(side="left")
 
             cpu = tk.Label(row, text="", bg=PANEL, fg=DIM, font=("Consolas", 11), width=10, anchor="e")
@@ -385,12 +429,12 @@ class Dashboard(tk.Tk):
 
             self.process_labels.append({"name": name, "cpu": cpu, "mem": mem})
 
-    def create_footer(self):
-        footer = tk.Frame(self, bg=BG)
+    def create_footer(self, parent):
+        footer = tk.Frame(parent, bg=BG)
         footer.pack(fill="x", padx=45, pady=20)
 
         self.status = tk.Label(
-            footer, text="● SYSTEM ONLINE", bg=BG, fg=GREEN, font=("Segoe UI", 12, "bold")
+            footer, text="\u25cf SYSTEM ONLINE", bg=BG, fg=GREEN, font=("Segoe UI", 12, "bold")
         )
         self.status.pack(side="left")
 
@@ -399,6 +443,104 @@ class Dashboard(tk.Tk):
             text=f"AFK SCREENSAVER: {Config.IDLE_SECONDS}s   |   ESC quit   |   F11 toggle fullscreen",
             bg=BG, fg=DIM, font=("Segoe UI", 9)
         ).pack(side="right")
+
+    # ========================================================
+    # APPS VIEW
+    # ========================================================
+
+    def create_apps_view(self, parent):
+        tk.Label(
+            parent, text="APPS", bg=BG, fg=RED, font=("Segoe UI", 22, "bold")
+        ).pack(anchor="w", padx=45, pady=(30, 4))
+
+        tk.Label(
+            parent, text="Launch a linked application", bg=BG, fg=DIM,
+            font=("Segoe UI", 11)
+        ).pack(anchor="w", padx=45, pady=(0, 20))
+
+        grid_frame = tk.Frame(parent, bg=BG)
+        grid_frame.pack(fill="both", expand=True, padx=40, pady=10)
+
+        columns = 4
+        for i in range(columns):
+            grid_frame.grid_columnconfigure(i, weight=1, uniform="apps")
+
+        if not Config.APPS:
+            tk.Label(
+                grid_frame, text="No apps configured. Add entries to Config.APPS.",
+                bg=BG, fg=DIM, font=("Segoe UI", 12)
+            ).grid(row=0, column=0, columnspan=columns, pady=40)
+        else:
+            for index, app in enumerate(Config.APPS):
+                row, col = divmod(index, columns)
+                self.create_app_tile(grid_frame, app, row, col)
+
+        footer = tk.Frame(parent, bg=BG)
+        footer.pack(fill="x", padx=45, pady=(10, 20), side="bottom")
+        tk.Label(
+            footer,
+            text="ESC quit   |   F11 toggle fullscreen   |   Click APPS again to return to the dashboard",
+            bg=BG, fg=DIM, font=("Segoe UI", 9)
+        ).pack(side="right")
+
+    def create_app_tile(self, parent, app, row, col):
+        tile = tk.Frame(parent, bg=PANEL, highlightbackground=DARK_RED, highlightthickness=1)
+        tile.grid(row=row, column=col, padx=10, pady=10, sticky="nsew")
+
+        name_label = tk.Label(
+            tile, text=app.get("name", "App"), bg=PANEL, fg=TEXT,
+            font=("Segoe UI", 14, "bold")
+        )
+        name_label.pack(padx=20, pady=(24, 6))
+
+        subtitle = app.get("url") or " ".join(app.get("command", [])) or "No target configured"
+        subtitle_label = tk.Label(
+            tile, text=subtitle, bg=PANEL, fg=DIM, font=("Segoe UI", 9), wraplength=180
+        )
+        subtitle_label.pack(padx=20, pady=(0, 16))
+
+        launch_btn = tk.Button(
+            tile, text="LAUNCH", command=lambda a=app: self.launch_app(a),
+            bg=BG, fg=RED, activebackground=DARK_RED, activeforeground=TEXT,
+            font=("Segoe UI", 10, "bold"), relief="flat", bd=0,
+            padx=14, pady=6, cursor="hand2",
+        )
+        launch_btn.pack(pady=(0, 20))
+
+        # Let clicking anywhere on the tile (not just the button) launch it.
+        for widget in (tile, name_label, subtitle_label):
+            widget.bind("<Button-1>", lambda e, a=app: self.launch_app(a))
+            widget.config(cursor="hand2")
+
+    def launch_app(self, app):
+        name = app.get("name", "app")
+        try:
+            if app.get("url"):
+                webbrowser.open(app["url"])
+                logging.info("Launched app '%s' via URL: %s", name, app["url"])
+            elif app.get("command"):
+                subprocess.Popen(app["command"])
+                logging.info("Launched app '%s' via command: %s", name, app["command"])
+            else:
+                logging.warning("App '%s' has no url or command configured", name)
+        except Exception as error:
+            logging.error("Failed to launch app '%s': %s", name, error)
+
+    def toggle_view(self):
+        if self.current_view == "dashboard":
+            self.show_apps_view()
+        else:
+            self.show_dashboard_view()
+
+    def show_dashboard_view(self):
+        self.current_view = "dashboard"
+        self.dashboard_frame.tkraise()
+        self.nav_button.config(text="APPS \u25b8")
+
+    def show_apps_view(self):
+        self.current_view = "apps"
+        self.apps_frame.tkraise()
+        self.nav_button.config(text="\u25c2 DASHBOARD")
 
     # ========================================================
     # DASHBOARD UPDATE
@@ -508,7 +650,7 @@ class Dashboard(tk.Tk):
             self._last_net = counters
             self._last_sample_time = now
 
-            return f"↑ {format_bytes_per_sec(sent_rate)}\n↓ {format_bytes_per_sec(recv_rate)}"
+            return f"\u2191 {format_bytes_per_sec(sent_rate)}\n\u2193 {format_bytes_per_sec(recv_rate)}"
 
         self.network.config(text=safe(calc, "Unavailable", "network"))
 
@@ -529,7 +671,7 @@ class Dashboard(tk.Tk):
             for name, entries in sensors.items():
                 for entry in entries:
                     if entry.current:
-                        return f"{entry.current:.0f}°C\n({entry.label or name})"
+                        return f"{entry.current:.0f}\u00b0C\n({entry.label or name})"
             return "No sensors found"
         self.temp.config(text=safe(calc, "Not supported", "temperature"))
 
@@ -552,7 +694,7 @@ class Dashboard(tk.Tk):
                 row["cpu"].config(text=f"{p['cpu_percent']:.1f}% cpu")
                 row["mem"].config(text=f"{p['memory_percent']:.1f}% mem")
             else:
-                row["name"].config(text="—")
+                row["name"].config(text="\u2014")
                 row["cpu"].config(text="")
                 row["mem"].config(text="")
 
@@ -637,7 +779,7 @@ class Dashboard(tk.Tk):
 
         cpu = safe(lambda: psutil.cpu_percent(interval=None), 0, "saver cpu")
         ram = safe(lambda: psutil.virtual_memory().percent, 0, "saver ram")
-        self.saver_stats.config(text=f"CPU {cpu:.0f}%   ·   MEM {ram:.0f}%")
+        self.saver_stats.config(text=f"CPU {cpu:.0f}%   \u00b7   MEM {ram:.0f}%")
 
         self.after(1000, self.update_screensaver)
 
