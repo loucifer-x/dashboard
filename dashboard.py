@@ -16,11 +16,11 @@ Toggle Apps panel: click "APPS" in the header
 import collections
 import logging
 import os
+import shutil
 import socket
 import subprocess
 import sys
 import time
-import webbrowser
 from datetime import datetime
 
 import tkinter as tk
@@ -62,13 +62,31 @@ class Config:
     THRESHOLD_CRIT = 85
 
     # --- Apps panel ---
-    # Each entry needs a "name" plus either a "url" (opened in the default
-    # web browser) or a "command" (a list, passed straight to subprocess.Popen,
-    # e.g. ["xterm"] or ["/usr/bin/some-tool", "--flag"]).
+    # Each entry needs a "name" plus either a "url" (opened via BROWSER_CANDIDATES,
+    # see below) or a "command" (a list, passed straight to subprocess.Popen,
+    # e.g. ["xterm"] or ["/usr/bin/some-tool", "--flag"]). If you know exactly
+    # which browser is installed on this machine, it's more reliable to skip
+    # "url" entirely and specify "command" directly, e.g.:
+    #   {"name": "Splunk", "command": ["chromium-browser", "--new-window", "https://splunk.example.com"]}
     APPS = [
         {"name": "Splunk", "url": "https://splunk.example.com"},
         # {"name": "Grafana", "url": "https://grafana.example.com"},
         # {"name": "Terminal", "command": ["xterm"]},
+    ]
+
+    # --- Browser launch (used only for APPS entries with "url") ---
+    # Tried in order; the first binary found on PATH (via shutil.which) is
+    # used. We do NOT rely on the webbrowser module / update-alternatives
+    # "www-browser" symlink, because on minimal/kiosk Linux installs that
+    # symlink is frequently unset and fails with a raw, uncatchable
+    # "failed to execute child process www-browser" error printed straight
+    # to stderr instead of a normal Python exception.
+    BROWSER_CANDIDATES = [
+        ["xdg-open", "{url}"],
+        ["google-chrome", "--new-window", "{url}"],
+        ["chromium-browser", "--new-window", "{url}"],
+        ["chromium", "--new-window", "{url}"],
+        ["firefox", "--new-window", "{url}"],
     ]
 
     # --- Logging ---
@@ -227,6 +245,10 @@ class Dashboard(tk.Tk):
 
         # View state ("dashboard" or "apps")
         self.current_view = "dashboard"
+
+        # Cache which browser binary works, so we only probe PATH once.
+        self._resolved_browser_cmd = None
+        self._browser_probe_done = False
 
         # Network / disk I/O baselines (for rate calculation)
         self._last_net = safe(psutil.net_io_counters, label="net_io_counters")
@@ -526,54 +548,72 @@ class Dashboard(tk.Tk):
             widget.config(cursor="hand2")
 
     def launch_app(self, app):
-    name = app.get("name", "app")
-    try:
-        if app.get("url"):
-            self._open_url(app["url"], name)
-        elif app.get("command"):
-            subprocess.Popen(app["command"])
-            logging.info("Launched app '%s' via command: %s", name, app["command"])
-        else:
-            logging.warning("App '%s' has no url or command configured", name)
-    except Exception as error:
-        logging.error("Failed to launch app '%s': %s", name, error)
+        name = app.get("name", "app")
+        try:
+            if app.get("url"):
+                self._open_url(app["url"], name)
+            elif app.get("command"):
+                subprocess.Popen(app["command"])
+                logging.info("Launched app '%s' via command: %s", name, app["command"])
+            else:
+                logging.warning("App '%s' has no url or command configured", name)
+        except Exception as error:
+            logging.error("Failed to launch app '%s': %s", name, error)
+
+    def _resolve_browser_cmd(self):
+        """
+        Find the first working browser command from Config.BROWSER_CANDIDATES,
+        based on what's actually on PATH. Cached after the first successful
+        probe so repeated launches don't re-scan the filesystem.
+
+        We deliberately do NOT use Python's webbrowser module here. On
+        minimal/kiosk Linux installs, webbrowser.open() falls back to the
+        update-alternatives "www-browser" symlink, which is frequently
+        unset and fails with a raw
+            "failed to execute child process 'www-browser'"
+        error printed straight to stderr -- not a catchable Python
+        exception -- so a try/except around webbrowser.open() doesn't
+        actually protect you from it.
+        """
+        if self._resolved_browser_cmd is not None:
+            return self._resolved_browser_cmd
+
+        self._browser_probe_done = True
+        for template in Config.BROWSER_CANDIDATES:
+            binary = template[0]
+            if shutil.which(binary):
+                self._resolved_browser_cmd = template
+                logging.info("Resolved browser for URL launches: %s", binary)
+                return template
+
+        logging.error(
+            "No working browser found on PATH. Tried: %s. "
+            "Install one of these, or set Config.APPS entries to use "
+            "\"command\" instead of \"url\" with the exact binary path.",
+            ", ".join(t[0] for t in Config.BROWSER_CANDIDATES),
+        )
+        return None
 
     def _open_url(self, url, name):
-        """
-        Open a URL in a real browser. We deliberately avoid webbrowser.open()
-        here -- on minimal/kiosk Linux installs it falls back to the
-        update-alternatives 'www-browser' symlink, which is often unset and
-        fails with 'failed to execute child process "www-browser"' instead of
-        raising a catchable Python exception.
-        """
-        candidates = [
-            ["xdg-open", url],
-            ["google-chrome", "--new-window", url],
-            ["chromium-browser", "--new-window", url],
-            ["chromium", "--new-window", url],
-            ["firefox", "--new-window", url],
-        ]
-    
-        for cmd in candidates:
-            browser_bin = cmd[0]
-            if shutil.which(browser_bin) is None:
-                continue
-            try:
-                subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-                logging.info("Launched app '%s' via %s: %s", name, browser_bin, url)
-                return
-            except Exception as error:
-                logging.warning("Browser '%s' failed for app '%s': %s", browser_bin, name, error)
-                continue
-    
-        logging.error(
-            "Launched app '%s' failed: no working browser found (tried %s)",
-            name, ", ".join(c[0] for c in candidates)
-        )
+        template = self._resolve_browser_cmd()
+        if template is None:
+            logging.error("Cannot launch app '%s': no browser available", name)
+            return
+
+        cmd = [part.format(url=url) for part in template]
+        try:
+            subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            logging.info("Launched app '%s' via %s: %s", name, cmd[0], url)
+        except Exception as error:
+            # This binary was on PATH but failed to actually run (e.g. a
+            # broken symlink). Drop the cached choice so the next launch
+            # re-probes instead of retrying the same broken command forever.
+            logging.error("Browser '%s' failed for app '%s': %s", cmd[0], name, error)
+            self._resolved_browser_cmd = None
 
     def toggle_view(self):
         if self.current_view == "dashboard":
