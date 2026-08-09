@@ -526,18 +526,54 @@ class Dashboard(tk.Tk):
             widget.config(cursor="hand2")
 
     def launch_app(self, app):
-        name = app.get("name", "app")
-        try:
-            if app.get("url"):
-                webbrowser.open(app["url"])
-                logging.info("Launched app '%s' via URL: %s", name, app["url"])
-            elif app.get("command"):
-                subprocess.Popen(app["command"])
-                logging.info("Launched app '%s' via command: %s", name, app["command"])
-            else:
-                logging.warning("App '%s' has no url or command configured", name)
-        except Exception as error:
-            logging.error("Failed to launch app '%s': %s", name, error)
+    name = app.get("name", "app")
+    try:
+        if app.get("url"):
+            self._open_url(app["url"], name)
+        elif app.get("command"):
+            subprocess.Popen(app["command"])
+            logging.info("Launched app '%s' via command: %s", name, app["command"])
+        else:
+            logging.warning("App '%s' has no url or command configured", name)
+    except Exception as error:
+        logging.error("Failed to launch app '%s': %s", name, error)
+
+    def _open_url(self, url, name):
+        """
+        Open a URL in a real browser. We deliberately avoid webbrowser.open()
+        here -- on minimal/kiosk Linux installs it falls back to the
+        update-alternatives 'www-browser' symlink, which is often unset and
+        fails with 'failed to execute child process "www-browser"' instead of
+        raising a catchable Python exception.
+        """
+        candidates = [
+            ["xdg-open", url],
+            ["google-chrome", "--new-window", url],
+            ["chromium-browser", "--new-window", url],
+            ["chromium", "--new-window", url],
+            ["firefox", "--new-window", url],
+        ]
+    
+        for cmd in candidates:
+            browser_bin = cmd[0]
+            if shutil.which(browser_bin) is None:
+                continue
+            try:
+                subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                logging.info("Launched app '%s' via %s: %s", name, browser_bin, url)
+                return
+            except Exception as error:
+                logging.warning("Browser '%s' failed for app '%s': %s", browser_bin, name, error)
+                continue
+    
+        logging.error(
+            "Launched app '%s' failed: no working browser found (tried %s)",
+            name, ", ".join(c[0] for c in candidates)
+        )
 
     def toggle_view(self):
         if self.current_view == "dashboard":
